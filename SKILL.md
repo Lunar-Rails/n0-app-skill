@@ -158,6 +158,14 @@ Create a multi-stage Dockerfile optimized for the detected stack.
 **Common patterns:**
 
 #### Node.js (React/Vue/Next.js SPA)
+
+**IMPORTANT: Build-time environment variables.** Frontend frameworks like Vite, Next.js, and
+CRA bake `import.meta.env.VITE_*` / `NEXT_PUBLIC_*` / `REACT_APP_*` variables into the JS
+bundle at build time. These values come from `.env` files during local dev, but `.env` is
+gitignored and NOT available during Docker builds. You **must** use `ARG` in the Dockerfile
+and `--build-arg` in the CI workflow to pass these values. Store them as Gitea org-level
+Actions secrets (e.g. `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`).
+
 ```dockerfile
 FROM node:20-alpine AS build
 WORKDIR /app
@@ -165,6 +173,8 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
 ARG VITE_API_URL=""
+ARG VITE_SUPABASE_URL=""
+ARG VITE_SUPABASE_ANON_KEY=""
 RUN npm run build
 
 FROM nginx:alpine
@@ -510,8 +520,11 @@ jobs:
 
       - name: Build and push Docker image
         run: |
-          docker build -t ${{ env.IMAGE }}:latest \
-                       -t ${{ env.IMAGE }}:${{ github.sha }} .
+          docker build \
+            --build-arg VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }} \
+            --build-arg VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }} \
+            -t ${{ env.IMAGE }}:latest \
+            -t ${{ env.IMAGE }}:${{ github.sha }} .
           docker push ${{ env.IMAGE }}:latest
           docker push ${{ env.IMAGE }}:${{ github.sha }}
 
@@ -687,6 +700,21 @@ For apps needing caching or session storage.
   }
 }
 ```
+
+### Using the Workspace Supabase (simpler alternative)
+
+If the workspace already has a running Supabase instance (most do), your app can use it
+directly instead of deploying its own. This is the **recommended approach for simple CRUD apps**.
+
+1. The Supabase API URL follows the pattern: `https://supabase-api-{workspace-slug}.apps.{domain}`
+2. The anon key is available as an org-level Gitea Actions secret: `VITE_SUPABASE_ANON_KEY`
+3. Pass both as Docker build args (see Workflow B template above)
+4. Create a `migration.sql` file and run it against the workspace Supabase Postgres
+5. Your app only needs a single `web` service — no database container needed
+
+**IMPORTANT:** Since `.env` files are gitignored and not available during Docker builds,
+you **must** pass Supabase credentials via `ARG` in the Dockerfile and `--build-arg` in
+the CI workflow. Without this, the app will try to connect to `localhost:54321` and fail.
 
 ### Supabase-backed app
 Full stack with Supabase (Postgres + Auth + REST API + API Gateway).
