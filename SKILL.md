@@ -31,11 +31,19 @@ This means:
 - The `image` field in `n0-app.json` **MUST** use the full registry path
 - The registry is **this workspace's own Gitea container registry**. Its host is provided
   as the org-level Gitea Actions **variable `REGISTRY`** (auto-provisioned for every
-  workspace — e.g. `127.0.0.1:30083`). Never hardcode a registry hostname.
+  workspace — e.g. `gitea-clovrlabs.apps.privateprompt.tech` or `127.0.0.1:30083`).
+  Never hardcode a registry hostname.
 - In **workflow YAML**, reference it as `${{ vars.REGISTRY }}`.
 - In the **`n0-app.json` image field** (which is NOT a workflow and has no `${{ }}`
-  substitution), write the **literal value** of the `REGISTRY` variable. Look it up with
-  `GET /api/v1/orgs/{org}/actions/variables/REGISTRY` and paste the value in.
+  substitution), write the **literal value** of the `REGISTRY` variable. Look it up with:
+  ```bash
+  # Requires org owner/admin Gitea token:
+  GET /api/v1/orgs/{org}/actions/variables/REGISTRY
+
+  # If you don't have org-level access, the REGISTRY value follows a
+  # predictable pattern: gitea-{workspace-slug}.apps.{platform-domain}
+  # e.g. gitea-clovrlabs.apps.privateprompt.tech
+  ```
 - Use Gitea Actions to automatically build and push the image on every commit.
 
 **Correct image format** (`<REGISTRY>` = the literal value of the `REGISTRY` org variable):
@@ -43,9 +51,9 @@ This means:
 <REGISTRY>/{org}/{repo}:{tag}
 ```
 
-**Example** (if `REGISTRY` resolves to `127.0.0.1:30083`):
+**Example** (if `REGISTRY` resolves to `gitea-clovrlabs.apps.privateprompt.tech`):
 ```json
-"image": "127.0.0.1:30083/clovrlabs/my-app:latest"
+"image": "gitea-clovrlabs.apps.privateprompt.tech/clovrlabs/my-app:latest"
 ```
 
 **NEVER use bare image names** like `"my-app:latest"` — the platform will try to pull from Docker Hub and fail.
@@ -506,6 +514,15 @@ jobs:
                        -t ${{ env.IMAGE }}:${{ github.sha }} .
           docker push ${{ env.IMAGE }}:latest
           docker push ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Import into k3s
+        run: |
+          docker save ${{ env.IMAGE }}:latest | k3s ctr images import --all-platforms -
+          echo "Image imported into k3s containerd"
+
+      - name: Cleanup
+        if: always()
+        run: docker rmi ${{ env.IMAGE }}:${{ github.sha }} 2>/dev/null || true
 ```
 
 **Notes (both workflows):**
@@ -514,6 +531,7 @@ jobs:
 - Both workflows use `docker login ${{ vars.REGISTRY }}` with org-level secrets `REGISTRY_USER` and `REGISTRY_PASSWORD` to authenticate with this workspace's Gitea container registry. The `REGISTRY` **variable** plus these two **secrets** are auto-provisioned at the org level for every workspace, so any new repo inherits them automatically — never hardcode the registry hostname
 - Workflow B uses `actions/checkout@v4` for cloning — do NOT use manual `git clone` with hardcoded runner-internal URLs
 - Two tags are pushed: `latest` (for the manifest) and either the commit SHA (for rollback) or the upstream tag (for version tracking)
+- **Workflow B must include `docker save | k3s ctr images import`** — this imports the image directly into k3s containerd, ensuring it's available for pod scheduling even before skopeo mirroring runs
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
 - The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
 
@@ -544,7 +562,7 @@ One container serving a web app. The image is built from the repo's Dockerfile.
   "entrypoint": "web",
   "services": {
     "web": {
-      "image": "127.0.0.1:30083/{org}/{repo}:latest",
+      "image": "<REGISTRY>/{org}/{repo}:latest",
       "port": 80,
       "memory_mb": 256
     }
@@ -633,7 +651,7 @@ Frontend/API with a PostgreSQL or MySQL database.
       "memory_mb": 512
     },
     "web": {
-      "image": "127.0.0.1:30083/{org}/{repo}:latest",
+      "image": "<REGISTRY>/{org}/{repo}:latest",
       "port": 3000,
       "env": {
         "DATABASE_URL": "postgres://app:changeme@db:5432/app",
@@ -658,7 +676,7 @@ For apps needing caching or session storage.
       "memory_mb": 128
     },
     "web": {
-      "image": "127.0.0.1:30083/{org}/{repo}:latest",
+      "image": "<REGISTRY>/{org}/{repo}:latest",
       "port": 3000,
       "env": {
         "REDIS_URL": "redis://redis:6379"
@@ -729,7 +747,7 @@ Full stack with Supabase (Postgres + Auth + REST API + API Gateway).
       "memory_mb": 256
     },
     "web": {
-      "image": "127.0.0.1:30083/{org}/{repo}:latest",
+      "image": "<REGISTRY>/{org}/{repo}:latest",
       "port": 80,
       "depends_on": ["kong"],
       "memory_mb": 128
@@ -1313,7 +1331,9 @@ Before finalizing, verify:
 - [ ] All services have `image` with specific tag
 - [ ] **Custom images use the workspace registry path** (`<REGISTRY>/{org}/{repo}:tag`, where `<REGISTRY>` is the literal value of the `REGISTRY` org variable, e.g. `127.0.0.1:30083`) — NEVER bare names like `my-app:latest`
 - [ ] **Upstream images use the full registry path** (e.g., `ghcr.io/org/app:stable`) — NOT just the image name
+- [ ] `.gitignore` excludes `node_modules/`, `.env`, `dist/`, etc.
 - [ ] `.gitea/workflows/build-and-push.yml` exists (build from source OR mirror upstream)
+- [ ] **Workflow includes `docker save | k3s ctr images import` step** (ensures image is available in k3s containerd)
 - [ ] **Workflow uses a hardcoded lowercase `IMAGE` env var** — NEVER use `${{ github.repository }}` in Docker tags (it preserves uppercase and Docker rejects it)
 - [ ] **Workflow branch trigger matches the repo's actual default branch** (not hardcoded `main`)
 - [ ] Database services have `volumes` for data persistence
@@ -1395,7 +1415,7 @@ After generating the manifest and pushing code to Gitea, the app must be **impor
 
 ### Prerequisites
 
-1. **Workspace admin JWT token** — only workspace admins can import and deploy apps
+1. **Workspace member JWT token** — any workspace member can import and deploy apps
 2. **Code + n0-app.json pushed to Gitea** — the repo must exist in the workspace's Gitea instance
 3. **Gitea Actions build completed** — the Docker image must be in the registry before deploy
 
@@ -1404,14 +1424,15 @@ After generating the manifest and pushing code to Gitea, the app must be **impor
 Register the app in the workspace catalog by pointing at the Gitea repo:
 
 ```bash
-# Login to get JWT token (must be a workspace admin)
+# Login to get JWT token
 TOKEN=$(curl -s -X POST https://app.privateprompt.tech/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"admin@example.com","password":"..."}' | \
+  -d '{"email":"you@example.com","password":"..."}' | \
   python3 -c "import json,sys; print(json.load(sys.stdin)['data']['tokens']['access_token'])")
 
 # Import app definition from Gitea repo
-curl -s -X POST "https://app.privateprompt.tech/api/v1/workspaces/${WS_ID}/apps/definitions" \
+# NOTE: trailing slash is required on this endpoint
+curl -s -X POST "https://app.privateprompt.tech/api/v1/workspaces/${WS_ID}/apps/definitions/" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"repo_url": "clovrlabs/my-app"}'
@@ -1471,19 +1492,20 @@ The K8sAppManager handles image sources automatically:
 
 | Image Pattern | Behavior |
 |--------------|----------|
-| `127.0.0.1:{port}/{org}/{repo}:{tag}` | Workspace Gitea registry — mirrored into in-cluster registry via skopeo Job |
+| `127.0.0.1:{port}/{org}/{repo}:{tag}` | Workspace Gitea registry (loopback) — mirrored into in-cluster registry via skopeo Job |
+| `gitea-{slug}.apps.{domain}/{org}/{repo}:{tag}` | Workspace Gitea registry (external hostname) — also mirrored via skopeo |
 | `postgres:16-alpine`, `redis:7-alpine` | Public Docker Hub — pulled directly by containerd |
 | `ghcr.io/org/app:stable` | External registry — pulled directly by containerd |
 | `localhost:5000/{path}` | Already in in-cluster registry — used as-is |
 
-**Important:** Images from the workspace Gitea registry use `127.0.0.1:{gitea_http_port}` as the host (NOT the external hostname). The runner pushes via loopback (hostNetwork), and the K8sAppManager recognizes the `127.0.0.1:` prefix to trigger skopeo mirroring.
+Both the loopback address (`127.0.0.1:{port}`) and external hostname (`gitea-{slug}.apps.{domain}`) formats are recognized as workspace Gitea registries and mirrored automatically. The CI workflow also imports images directly into k3s containerd via `docker save | k3s ctr images import` as a belt-and-suspenders approach.
 
 ### Common Deployment Errors
 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `AppDefinition matching query does not exist` | No AppDefinition for this `app_type` slug | Import the app first via `POST /definitions` |
-| `Only workspace admins can deploy apps` | User is not a workspace admin | Use an admin account |
+| `Only workspace admins can deploy apps` | User is not a workspace member | Ensure the user is a member of the workspace |
 | `Unknown app type` | The `app_type` doesn't match any built-in or AppDefinition slug | Check the slug in n0-app.json |
 | Image pull failure | Image not in registry or wrong tag | Check Gitea Actions build succeeded; verify `REGISTRY_USER`/`REGISTRY_PASSWORD` org secrets |
 | Build push failure | Stale or missing registry credentials | Re-provision org-level Actions secrets (see below) |
@@ -1531,19 +1553,25 @@ Build your app with any framework. Add these files to the repo root:
 - `n0-app.json` — N0 manifest (see schema above)
 - `Dockerfile` — multi-stage build for production
 - `.dockerignore` — exclude `node_modules`, `.git`, etc.
+- `.gitignore` — exclude `node_modules/`, `.env`, `dist/`, etc.
 - `.gitea/workflows/build-and-push.yml` — CI workflow
 
 ### 3. Look Up the REGISTRY Value
 
-Before writing the manifest, look up the org-level `REGISTRY` variable:
+Before writing the manifest, determine the workspace's Gitea container registry host.
 
+**Option A — API lookup** (requires org owner token):
 ```bash
 curl -s -H "Authorization: token $GITEA_TOKEN" \
   "https://${GITEA_HOST}/api/v1/orgs/clovrlabs/actions/variables/REGISTRY" | \
-  python3 -c "import json,sys; print(json.load(sys.stdin)['value'])"
+  python3 -c "import json,sys; print(json.load(sys.stdin)['data'])"
 ```
 
-Use this literal value (e.g., `127.0.0.1:32102`) in both `n0-app.json` image fields AND the workflow `IMAGE` env var.
+**Option B — Predictable pattern** (works for any workspace member):
+The REGISTRY hostname follows the pattern `gitea-{workspace-slug}.apps.{platform-domain}`.
+For the `clovrlabs` workspace on staging: `gitea-clovrlabs.apps.privateprompt.tech`
+
+Use this value in `n0-app.json` image fields. In the workflow YAML, always use `${{ vars.REGISTRY }}` (which resolves at CI runtime).
 
 ### 4. Push to Gitea
 
@@ -1565,17 +1593,17 @@ curl -s -H "Authorization: token $GITEA_TOKEN" \
 ### 6. Import + Deploy via API
 
 ```bash
-N0_TOKEN="<admin-jwt-token>"
+N0_TOKEN="<jwt-token>"
 WS_ID="<workspace-uuid>"
 API="https://app.privateprompt.tech/api/v1"
 
-# Import app definition
-curl -s -X POST "$API/workspaces/$WS_ID/apps/definitions" \
+# Import app definition (trailing slash required)
+curl -s -X POST "$API/workspaces/$WS_ID/apps/definitions/" \
   -H "Authorization: Bearer $N0_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"repo_url": "clovrlabs/my-app"}'
 
-# Deploy
+# Deploy (trailing slash required)
 curl -s -X POST "$API/workspaces/$WS_ID/apps/" \
   -H "Authorization: Bearer $N0_TOKEN" \
   -H "Content-Type: application/json" \
@@ -1596,30 +1624,52 @@ open "https://my-app.apps.privateprompt.tech"
 
 ### Getting Credentials for Local Development
 
-**Gitea personal access token** (for git push):
-- Visit `https://gitea-clovrlabs.apps.privateprompt.tech/-/user/settings/applications`
-- Click "Generate New Token" → select scopes → copy token
-- Or via API (requires admin):
-  ```bash
-  kubectl -n n0-clovrlabs exec deployment/gitea -- \
-    gitea admin user generate-access-token \
-    --username <your-username> --token-name dev --scopes all --raw
-  ```
-
-**Supabase credentials** (for database access):
-- Visible in the N0 web UI under **Connectors** page
-- Or via the API (workspace connection):
-  ```bash
-  curl -s "$API/workspaces/$WS_ID/connectors/" \
-    -H "Authorization: Bearer $N0_TOKEN" | \
-    python3 -c "import json,sys; conns=json.load(sys.stdin)['data']['connections']; [print(f'{c[\"connector_slug\"]}: {c.get(\"extra_config\",{})}') for c in conns if c['connector_slug']=='supabase']"
-  ```
-
 **N0 API JWT token** (for deploying):
 ```bash
+# NOTE: no trailing slash on /auth/login
 curl -s -X POST "$API/auth/login" \
   -H "Content-Type: application/json" \
   -d '{"email":"you@example.com","password":"..."}' | \
   python3 -c "import json,sys; print(json.load(sys.stdin)['data']['tokens']['access_token'])"
 ```
+
+**Workspace ID** (needed for deploy API calls):
+```bash
+curl -s "$API/workspaces/" \
+  -H "Authorization: Bearer $N0_TOKEN" | \
+  python3 -c "import json,sys; ws=json.load(sys.stdin)['data']; [print(f'{w[\"slug\"]}: {w[\"id\"]}') for w in ws]"
+```
+
+**Gitea personal access token** (for git push):
+- Visit `https://gitea-{workspace-slug}.apps.{platform-domain}/-/user/settings/applications`
+- Click "Generate New Token" → select `write:repository, write:package` scopes → copy token
+- Or via Gitea API (if you already have a token with `write:user` scope):
+  ```bash
+  curl -s -X POST "https://${GITEA_HOST}/api/v1/users/{username}/tokens" \
+    -H "Authorization: token $EXISTING_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"name": "deploy-token", "scopes": ["write:repository", "write:package"]}'
+  ```
+
+**Supabase credentials** (for apps using the workspace Supabase):
+- **URL**: follows a predictable pattern: `https://supabase-api-{workspace-slug}.apps.{platform-domain}`
+  - Example: `https://supabase-api-clovrlabs.apps.privateprompt.tech`
+- **Anon key**: visible in the N0 web UI under **Connectors** page
+- These are set as `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in your local `.env` file (gitignored)
+- Run `migration.sql` against the Supabase Postgres to create your tables
+
+### API Endpoint Trailing Slash Rules
+
+Django REST Framework endpoints in N0 require **trailing slashes** on most endpoints.
+Notable exceptions:
+
+| Endpoint | Trailing Slash |
+|----------|---------------|
+| `POST /api/v1/auth/login` | **No** trailing slash |
+| `POST /api/v1/auth/register` | **No** trailing slash |
+| `POST .../apps/definitions/` | **Yes** — trailing slash required |
+| `POST .../apps/` | **Yes** — trailing slash required |
+| `GET .../workspaces/` | **Yes** — trailing slash required |
+
+If you get a `301 Moved Permanently` response, add a trailing slash.
 
