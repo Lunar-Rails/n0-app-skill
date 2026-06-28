@@ -1680,11 +1680,23 @@ curl -s "$API/workspaces/" \
   ```
 
 **Supabase credentials** (for apps using the workspace Supabase):
-- **URL**: follows a predictable pattern: `https://supabase-api-{workspace-slug}.apps.{platform-domain}`
-  - Example: `https://supabase-api-clovrlabs.apps.privateprompt.tech`
-- **Anon key**: visible in the N0 web UI under **Connectors** page
+- **Via API** (recommended):
+  ```bash
+  curl -s "$API/workspaces/$WS_ID/supabase/credentials/" \
+    -H "Authorization: Bearer $N0_TOKEN" | \
+    python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(f'URL: {d[\"url\"]}\nAnon key: {d[\"anon_key\"]}')"
+  ```
+- **URL pattern**: `https://supabase-api-{workspace-slug}.apps.{platform-domain}`
 - These are set as `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in your local `.env` file (gitignored)
-- Run `migration.sql` against the Supabase Postgres to create your tables
+
+**Running Supabase migrations** (for creating tables, RLS policies, etc.):
+```bash
+curl -s -X POST "$API/workspaces/$WS_ID/supabase/sql/" \
+  -H "Authorization: Bearer $N0_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$(python3 -c "import json; print(json.dumps({'sql': open('migration.sql').read()}))")"
+```
+This executes SQL against the workspace Supabase Postgres in the `public` schema — no SSH or kubectl needed.
 
 ### API Endpoint Trailing Slash Rules
 
@@ -1698,6 +1710,8 @@ Notable exceptions:
 | `POST .../apps/definitions/` | **Yes** — trailing slash required |
 | `POST .../apps/` | **Yes** — trailing slash required |
 | `GET .../workspaces/` | **Yes** — trailing slash required |
+| `GET .../supabase/credentials/` | Both work (with or without) |
+| `POST .../supabase/sql/` | Both work (with or without) |
 
 If you get a `301 Moved Permanently` response, add a trailing slash.
 
