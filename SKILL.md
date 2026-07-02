@@ -627,6 +627,10 @@ jobs:
           docker push ${{ env.IMAGE }}:latest
           docker push ${{ env.IMAGE }}:${{ github.sha }}
 
+      # Only include this step if the runner has the k3s binary (host-mode runners).
+      # Containerized runners fail here with exit 127 "k3s: command not found" —
+      # in that case drop this step and pin the manifest image to the commit-SHA
+      # tag instead (see "Redeploy" below).
       - name: Import into k3s
         run: |
           docker save ${{ env.IMAGE }}:latest | k3s ctr images import --all-platforms -
@@ -643,7 +647,7 @@ jobs:
 - Both workflows use `docker login ${{ vars.REGISTRY }}` with org-level secrets `REGISTRY_USER` and `REGISTRY_PASSWORD` to authenticate with this workspace's Gitea container registry. The `REGISTRY` **variable** plus these two **secrets** are auto-provisioned at the org level for every workspace, so any new repo inherits them automatically — never hardcode the registry hostname
 - Workflow B uses `actions/checkout@v4` for cloning — do NOT use manual `git clone` with hardcoded runner-internal URLs
 - Two tags are pushed: `latest` (for the manifest) and either the commit SHA (for rollback) or the upstream tag (for version tracking)
-- **Workflow B must include `docker save | k3s ctr images import`** — this imports the image directly into k3s containerd, ensuring it's available for pod scheduling even before skopeo mirroring runs
+- **Workflow B should include `docker save | k3s ctr images import` when the runner supports it** — this imports the image directly into k3s containerd, ensuring it's available for pod scheduling even before skopeo mirroring runs. **Not all workspaces have host-mode runners**: on containerized runners the step fails with exit 127 (`k3s: command not found`). Check the runner first, or just rely on commit-SHA image pinning in the manifest (see the Redeploy section) which works everywhere
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
 - The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
 
@@ -1552,7 +1556,7 @@ Before finalizing, verify:
 - [ ] **Upstream images use the full registry path** (e.g., `ghcr.io/org/app:stable`) — NOT just the image name
 - [ ] `.gitignore` excludes `node_modules/`, `.env`, `dist/`, etc.
 - [ ] `.gitea/workflows/build-and-push.yml` exists (build from source OR mirror upstream)
-- [ ] **Workflow includes `docker save | k3s ctr images import` step** (ensures image is available in k3s containerd)
+- [ ] **Workflow includes `docker save | k3s ctr images import` step if the runner has k3s** (containerized runners don't — omit the step and pin the manifest image to the commit-SHA tag instead)
 - [ ] **Workflow uses a hardcoded lowercase `IMAGE` env var** — NEVER use `${{ github.repository }}` in Docker tags (it preserves uppercase and Docker rejects it)
 - [ ] **Workflow branch trigger matches the repo's actual default branch** (not hardcoded `main`)
 - [ ] Database services have `volumes` for data persistence
@@ -1660,6 +1664,13 @@ This fetches `n0-app.json` from the repo, validates it, and creates an `AppDefin
 - Short form: `org/repo` (uses workspace's own Gitea)
 - Full URL: `https://gitea-clovrlabs.apps.privateprompt.tech/org/repo`
 
+**Prefer the full URL.** On some deployments (observed on prod `app.nzero.pro`) the
+short form fails with a misleading `No n0-app.json found in org/repo` error even when
+the manifest is present on the default branch; the full-URL form works immediately.
+
+Re-run this same call after changing `n0-app.json` (e.g. bumping a pinned image tag) —
+it updates the existing AppDefinition in place (`"created": false` in the response).
+
 ### Step 2: Deploy App Instance
 
 ```bash
@@ -1695,6 +1706,23 @@ curl -s -X POST "$N0_API_BASE/workspaces/${WS_ID}/apps/definitions/" \
 curl -s -X POST "$N0_API_BASE/workspaces/${WS_ID}/apps/${APP_ID}/redeploy" \
   -H "Authorization: Bearer $N0_API_TOKEN" -H "Content-Type: application/json" -d '{}'
 ```
+
+**WARNING — redeploy does NOT pick up a new `:latest` build by itself.** k3s containerd
+caches the image by tag: if the pod's image reference is unchanged (`...:latest`), the
+node reuses the cached image and the app keeps serving the old build. A `{"tag": "..."}`
+body on the redeploy call is accepted but ignored. Reliable update flow when the CI
+workflow cannot import into k3s directly:
+
+1. Push code → CI builds and pushes both `:latest` and `:{commit-sha}` tags
+2. Pin the image in `n0-app.json` to the full commit-SHA tag
+   (`localhost:5000/org/repo:<sha>`) and push
+3. Re-import the definition (`POST .../apps/definitions/` with the full repo URL)
+4. Redeploy — the changed image reference forces a fresh pull
+
+Verify what's actually deployed by temporarily setting the app public
+(`PUT .../apps/{APP_ID}/access` with `{"access_level": "public"}`), curling a content
+marker from the site, then reverting to `workspace`. Note: access-level changes only
+take effect at the Caddy layer after a redeploy.
 
 ### Deploy Versioning & Rollback
 
@@ -1746,6 +1774,9 @@ Both the loopback address (`127.0.0.1:{port}`) and external hostname (`gitea-{sl
 | `Unknown app type` | The `app_type` doesn't match any built-in or AppDefinition slug | Check the slug in n0-app.json |
 | Image pull failure | Image not in registry or wrong tag | Check Gitea Actions build succeeded; verify `REGISTRY_USER`/`REGISTRY_PASSWORD` org secrets |
 | Build push failure | Stale or missing registry credentials | Re-provision org-level Actions secrets (see below) |
+| `No n0-app.json found` on import despite manifest in repo root | Short-form `org/repo` repo_url not resolved on this deployment | Use the full Gitea URL as `repo_url` |
+| App serves old version after redeploy | k3s containerd cached the unchanged `:latest` tag | Pin the manifest image to the commit-SHA tag, re-import definition, redeploy |
+| Actions run stuck "in_progress" then marked "failure", but image was pushed | Runner's final status report to Gitea timed out — bookkeeping only | Trust the job log (`/actions/runs/{run}/jobs` → `/actions/jobs/{id}/logs`): if it ends with "Job succeeded" and shows push digests, the build is fine |
 
 ### Troubleshooting Registry Credentials
 
