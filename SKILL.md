@@ -10,6 +10,12 @@ user-invocable: true
 argument-hint: "[optional: path to repo or description of the app]"
 ---
 
+<!--
+  SOURCE OF TRUTH: https://github.com/Lunar-Rails/n0-app-skill
+  All other copies (N0 sandbox template django_backend/sandbox/templates/skills/n0-app/,
+  local ~/.claude/skills installs) are mirrors. Edit on GitHub, then sync mirrors.
+-->
+
 # N0 App Skill
 
 Analyze a codebase and generate everything needed to deploy it as a hosted app on N0.
@@ -104,7 +110,7 @@ git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/ori
 
 ### Step 2: Decide the Image Strategy
 
-**Choose ONE of these two paths:**
+**Choose ONE of these three paths:**
 
 #### Path A: Use Upstream Pre-built Images (preferred when available)
 
@@ -143,6 +149,52 @@ Use this path when:
 - The app is a simple SPA, API server, or static site
 
 Continue to Step 2b below.
+
+#### Path C: Zero-Build App (config_files — fastest iteration, no CI)
+
+Use this path when:
+- The app is a small/medium single-service app (Node/Python script + static assets)
+- You want the fastest possible edit → deploy loop (no Docker build, no registry, no CI wait)
+- Total source size fits comfortably under **1 MiB** (Kubernetes ConfigMap limit — includes JSON overhead; keep the embedded payload under ~900 KB)
+
+**How it works:** use a stock public image (e.g. `node:20-alpine`, `python:3.12-alpine`) and embed the entire app source in `config_files` on a volume. The platform writes the files into the volume before the container starts, and `command` runs them directly:
+
+```json
+{
+  "services": {
+    "web": {
+      "image": "node:20-alpine",
+      "port": 3000,
+      "command": ["node", "/app/server.js"],
+      "volumes": {
+        "app": {"mount": "/app"},
+        "data": {"mount": "/data", "persistent": true}
+      },
+      "config_files": {
+        "app": {
+          "server.js": "...entire file contents...",
+          "index.html": "...entire file contents..."
+        }
+      }
+    }
+  }
+}
+```
+
+Key points:
+- **No Dockerfile, no Gitea Actions workflow, no registry** — skip Steps 2b and 5 entirely
+- Store app state in a **persistent volume** (e.g. `/data/db.json`) — the config_files volume is recreated on every deploy
+- Binary assets (images, audio) can be embedded as base64 strings and decoded by the server at startup
+- The deploy loop is: edit source files → **regenerate `n0-app.json`** (script that reads the files and patches `services.web.config_files.app`) → push both to Gitea → re-import the definition (`POST .../apps/definitions/` with `{"repo_url": ...}`) → `POST .../apps/{id}/redeploy` with `{}`
+- **Never hand-edit the embedded copies inside n0-app.json** — always regenerate from the real source files, e.g.:
+  ```python
+  import json
+  m = json.load(open("n0-app.json"))
+  cf = m["services"]["web"]["config_files"]["app"]
+  for f in ("server.js", "index.html"):
+      cf[f] = open(f).read()
+  json.dump(m, open("n0-app.json", "w"), indent=2)
+  ```
 
 ### Step 2b: Generate the Dockerfile
 
@@ -1443,9 +1495,13 @@ After generating the manifest and pushing code to Gitea, the app must be **impor
 
 ### Prerequisites
 
-1. **Workspace member JWT token** — any workspace member can import and deploy apps
+1. **Workspace member JWT token or Personal Access Token** — any workspace member can import and deploy apps
 2. **Code + n0-app.json pushed to Gitea** — the repo must exist in the workspace's Gitea instance
-3. **Gitea Actions build completed** — the Docker image must be in the registry before deploy
+3. **Gitea Actions build completed** — the Docker image must be in the registry before deploy (not needed for Path C zero-build apps)
+
+**API response envelope:** all N0 API responses are wrapped as `{"success": true, "data": {...}}` — read fields from `data`, not the top level.
+
+**Verifying a deployed (workspace-gated) app from the CLI:** apps behind SSO can be curled by appending an iframe token: `TOK=$(curl -s -H "Authorization: Bearer $TOKEN" "https://app.../api/v1/apps/iframe-token" | python3 -c "import json,sys;print(json.load(sys.stdin)['data']['token'])")` then `curl "https://my-app.apps.../?_ppauth=$TOK"`. Add a cache-buster query param when verifying fresh deploys.
 
 ### Step 1: Import App Definition
 
@@ -1493,10 +1549,29 @@ The deploy is async — a background Huey task:
 
 ### Step 3: Redeploy (after code changes)
 
+For zero-build (config_files) apps, **re-import the definition first** so the platform picks up the new `n0-app.json` from Gitea, then redeploy:
+
 ```bash
+# 1. Re-import (refreshes AppDefinition.manifest + source commit)
+curl -s -X POST "https://app.privateprompt.tech/api/v1/workspaces/${WS_ID}/apps/definitions/" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"repo_url": "clovrlabs/my-app"}'
+
+# 2. Redeploy the running instance
 curl -s -X POST "https://app.privateprompt.tech/api/v1/workspaces/${WS_ID}/apps/${APP_ID}/redeploy" \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}'
 ```
+
+### Deploy Versioning & Rollback
+
+**Every deploy gets a unique version tag** — never rely on `latest` as a version identifier:
+
+- The platform tags each deploy record with the app definition's **source commit short-sha** (or a `vYYYYMMDD-HHMMSS` timestamp when no commit is available) and stores a **full manifest snapshot** on the deploy record
+- The Studio UI shows the deployed version and the per-deploy tags in Deploy History
+- **Rollback**: `POST .../apps/${APP_ID}/redeploy` with `{"record_id": "<deploy-record-id>"}` restores that record's manifest snapshot (config_files, images, env) and redeploys it — a true rollback, not just a re-pull
+- Only pass `{"image_tag": "..."}` when you explicitly want to deploy a different **image** tag of a custom-built image; version labels are NOT image tags
+
+Practical rule for zero-build apps: since the "version" lives in the manifest (ConfigMaps), always push a Gitea commit per change and re-import before redeploying — that commit sha becomes the deploy's version tag and enables rollback.
 
 ### Other Operations
 
