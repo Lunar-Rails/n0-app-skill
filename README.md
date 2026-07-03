@@ -2,12 +2,14 @@
 
 A Claude Code skill for analyzing codebases and generating everything needed to deploy them on [N0](https://nzero.pro) — a self-hosted team platform with per-workspace app hosting.
 
+> **This repository is the single source of truth for the n0-app skill.** Copies shipped inside N0 agent sandboxes (`/workspace/skills/n0-app/SKILL.md`) and local installs are mirrors of this repo — contribute changes here.
+
 ## What it does
 
 When triggered, this skill:
 
 1. **Analyzes** a repository to detect the tech stack, framework, ports, databases, and dependencies
-2. **Decides the image strategy**: use upstream pre-built images OR generate a custom `Dockerfile`
+2. **Decides the image strategy**: upstream pre-built images, a custom `Dockerfile`, OR a zero-build `config_files` app (no CI needed)
 3. **Generates** an `n0-app.json` manifest describing all services
 4. **Generates** a `.gitea/workflows/build-and-push.yml` CI workflow for building and pushing Docker images
 5. **Validates** the output against N0's manifest schema
