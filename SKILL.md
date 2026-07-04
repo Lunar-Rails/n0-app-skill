@@ -926,6 +926,42 @@ extensions, or if the Prisma schema / SQL migrations reference `vector` types.
 | `POSTGRES_INITDB_ARGS` | Extra args for `initdb` | `--data-checksums` |
 | `POSTGRES_HOST_AUTH_METHOD` | Auth method for local connections | `trust` or `scram-sha-256` |
 
+## Platform Geo Services (Tiles & Geocoding)
+
+N0 self-hosts a map tile server and a geocoder that any hosted app can use — prefer
+these over third-party services (Mapbox keys, rate-limited Nominatim) when building
+map/location features.
+
+### Map Tiles (n0-tiles)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `https://tiles.privateprompt.tech/style/style.json` | MapLibre GL vector style (OSM Liberty basemap) — pass directly as the `style` option of a MapLibre map |
+| `https://tiles.privateprompt.tech/martin/catalog` | Martin tile server catalog (vector tilesets, e.g. `europe` OpenMapTiles) |
+| `https://tiles.privateprompt.tech/martin/{tileset}` | TileJSON for a tileset |
+
+- **No auth required** for tiles/styles; CORS is open (`Access-Control-Allow-Origin: *`), so the browser can load them directly.
+- One shared instance serves **all environments** (staging, production, moon).
+- Pattern: expose the style URL via a server env var (e.g. `TILES_STYLE_URL`) and hand it to the client through a small `/api/config` endpoint, so it can be swapped per deploy.
+- The basemap is vector ("map" mode). For terrain/satellite modes, use public rasters (OpenTopoMap, Esri World Imagery) as additional MapLibre raster styles.
+
+### Geocoding (Photon via the N0 API proxy)
+
+A self-hosted [Photon](https://github.com/komoot/photon) geocoder (full planet index) is
+exposed through an authenticated N0 API proxy — the upstream token stays server-side:
+
+```
+GET {N0_API_BASE}/workspaces/{WORKSPACE_ID}/geocode/search?q=Berlin&limit=5
+GET {N0_API_BASE}/workspaces/{WORKSPACE_ID}/geocode/reverse?lat=52.52&lon=13.40
+Authorization: Bearer <PAT with geo:read scope>
+```
+
+- Responses are Photon **GeoJSON FeatureCollections**, wrapped in the standard `{"success": true, "data": {...}}` envelope.
+- Requires a **Personal Access Token with the `geo:read` scope** and workspace membership. PATs are created from the web UI (Settings → API Tokens) — the token endpoints require a browser session, and PATs cannot mint other PATs.
+- Inject the token into the app as a **secret** (Vault via `PUT .../apps/{id}/secrets` with `{"services": {"web": {"N0_GEO_TOKEN": "clovr_pat_..."}}}`), never in the manifest.
+- **Call it server-side** from your app (the browser should hit your app's own `/api/geocode` proxy), and fall back to public Nominatim when the token/scope is missing so the app degrades gracefully.
+- Reference implementation: the `n0map` app (`lunarrails/n0map` on the moon Gitea) — server-side Photon→Nominatim fallback, `/api/config` style handoff, and basemap mode switching.
+
 ## Security Notes
 
 - **Never hardcode real secrets** in the manifest. Use empty placeholder values -- real secrets are injected from Vault at deploy time (see "Secrets Management with Vault" below).
