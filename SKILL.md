@@ -926,6 +926,98 @@ extensions, or if the Prisma schema / SQL migrations reference `vector` types.
 | `POSTGRES_INITDB_ARGS` | Extra args for `initdb` | `--data-checksums` |
 | `POSTGRES_HOST_AUTH_METHOD` | Auth method for local connections | `trust` or `scram-sha-256` |
 
+## Platform Geo Services (Tiles & Geocoding)
+
+N0 self-hosts a map tile server and a geocoder that any hosted app can use — prefer
+these over third-party services (Mapbox keys, rate-limited Nominatim) when building
+map/location features.
+
+### Map Tiles (n0-tiles)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `https://tiles.privateprompt.tech/style/style.json` | MapLibre GL vector style (OSM Liberty basemap) — pass directly as the `style` option of a MapLibre map |
+| `https://tiles.privateprompt.tech/martin/catalog` | Martin tile server catalog (vector tilesets, e.g. `europe` OpenMapTiles) |
+| `https://tiles.privateprompt.tech/martin/{tileset}` | TileJSON for a tileset |
+
+- **No auth required** for tiles/styles; CORS is open (`Access-Control-Allow-Origin: *`), so the browser can load them directly.
+- One shared instance serves **all environments** (staging, production, moon).
+- Pattern: expose the style URL via a server env var (e.g. `TILES_STYLE_URL`) and hand it to the client through a small `/api/config` endpoint, so it can be swapped per deploy.
+- The basemap is vector ("map" mode). For terrain/satellite modes, use public rasters (OpenTopoMap, Esri World Imagery) as additional MapLibre raster styles.
+
+### Geocoding (Photon via the N0 API proxy)
+
+A self-hosted [Photon](https://github.com/komoot/photon) geocoder (full planet index) is
+exposed through an authenticated N0 API proxy — the upstream token stays server-side:
+
+```
+GET {N0_API_BASE}/workspaces/{WORKSPACE_ID}/geocode/search?q=Berlin&limit=5
+GET {N0_API_BASE}/workspaces/{WORKSPACE_ID}/geocode/reverse?lat=52.52&lon=13.40
+Authorization: Bearer <PAT with geo:read scope>
+```
+
+- Responses are Photon **GeoJSON FeatureCollections**, wrapped in the standard `{"success": true, "data": {...}}` envelope.
+- Requires a **Personal Access Token with the `geo:read` scope** and workspace membership.
+- **Preferred:** declare `"platform_scopes": ["geo:read"]` in the manifest and the platform auto-injects `N0_PLATFORM_TOKEN` / `N0_API_BASE` / `N0_WORKSPACE_ID` at deploy time — see "Platform API Tokens" below.
+- **Manual alternative:** create a PAT from the web UI (Settings → API Tokens — token endpoints require a browser session; PATs cannot mint other PATs) and inject it as a **secret** (Vault via `PUT .../apps/{id}/secrets` with `{"services": {"web": {"N0_GEO_TOKEN": "clovr_pat_..."}}}`), never in the manifest.
+- **Call it server-side** from your app (the browser should hit your app's own `/api/geocode` proxy), and fall back to public Nominatim when the token/scope is missing so the app degrades gracefully.
+- Reference implementation: the `n0map` app (`lunarrails/n0map` on the moon Gitea) — server-side Photon→Nominatim fallback, `/api/config` style handoff, and basemap mode switching.
+
+## Platform API Tokens (`platform_scopes`)
+
+Apps can request an auto-provisioned platform API token by declaring the scopes
+they need in the manifest — no manual PAT creation or Vault plumbing required:
+
+```json
+{
+  "name": "My Maps App",
+  "slug": "mymaps",
+  "platform_scopes": ["geo:read"]
+}
+```
+
+At deploy time the platform mints a scoped Personal Access Token and injects it
+into **every service container** as environment variables:
+
+| Env var | Value |
+|---------|-------|
+| `N0_PLATFORM_TOKEN` | The raw PAT (`clovr_pat_...`) — always set/overwritten by the platform |
+| `N0_API_BASE` | Platform API base, e.g. `https://app.moon.nzero.pro/api/v1` (default only — manifest `env` wins if set) |
+| `N0_WORKSPACE_ID` | UUID of the workspace the app is installed in (default only) |
+
+Example server-side usage (geocoding without any manual token setup):
+
+```js
+const r = await fetch(
+  `${process.env.N0_API_BASE}/workspaces/${process.env.N0_WORKSPACE_ID}/geocode/search?q=Berlin`,
+  { headers: { Authorization: `Bearer ${process.env.N0_PLATFORM_TOKEN}` } }
+);
+```
+
+**Grantable scopes (allowlist):** `geo:read`, `workspaces:read`, `members:read`,
+`users:read`, `boards:read`, `boards:write`, `channels:read`, `channels:write`,
+`apps:read`, `supabase:read`, `profile:read`.
+
+Anything outside the allowlist (`apps:write`, `gitea:write`, `supabase:write`,
+`dms:*`, `profile:write`, token management, …) is **rejected at definition
+import** with a 400 error — apps can never escalate into deployment, repo
+administration, or private messages.
+
+**Security semantics:**
+
+- The token is owned by a per-workspace **service account** (a bot user), not by
+  the installing human — it survives user offboarding and can't act as a person.
+- It is **workspace-restricted**: unusable against any other workspace.
+- It is **rotated on every deploy/redeploy** — never persist it outside the
+  container env; read it from `process.env` at request time.
+- It is **revoked automatically** when the app is uninstalled/destroyed.
+- Only call it **server-side**. Never expose `N0_PLATFORM_TOKEN` to the browser;
+  proxy through your app's own API routes.
+- Keep scopes minimal — request only what the app actually calls.
+
+For scopes outside the allowlist, fall back to the manual pattern above (user-created
+PAT stored as a Vault secret via `PUT .../apps/{id}/secrets`).
+
 ## Security Notes
 
 - **Never hardcode real secrets** in the manifest. Use empty placeholder values -- real secrets are injected from Vault at deploy time (see "Secrets Management with Vault" below).
