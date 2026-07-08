@@ -1403,6 +1403,9 @@ For apps that have their own authentication system and can't use reverse proxy a
 | `scopes` | No | string[] | Available scopes (informational, displayed in UI) |
 | `help_text` | No | string | Help text shown when connecting (useful for `api_key` type) |
 | `help_url_path` | No | string | Relative path to help page within the app (must start with `/`) |
+| `tools` | No | object[] | *(Pending ADR-0033, not yet live)* Named agent tools with JSON Schemas (see "Declarative Tools" below) |
+| `protocol` | No | string | *(Pending ADR-0033, not yet live)* `http` (default) or `mcp` (see "MCP Connectors" below) |
+| `mcp_path` | No | string | *(Pending ADR-0033, not yet live)* Path of the MCP streamable-HTTP endpoint (default `/mcp`) |
 
 ### Example: Platform Identity Connector
 
@@ -1495,6 +1498,105 @@ An app can publish multiple connectors (e.g., separate read/write APIs):
 }
 ```
 
+### Declarative Tools (Named Agent Tools)
+
+> **Status: not yet live.** Declarative `tools` (and MCP connectors below) are specified in ADR-0033 and pending platform implementation. Until the platform ships support, `tools`, `protocol`, and `mcp_path` entries are ignored by `sync_app_connectors()` — declare them only if the user asks to prepare for it, and tell the user they are not active yet. Do not claim named tools work today.
+
+Instead of only declaring a `base_path` (which forces the agent to guess your API's shape), declare **named tools with JSON Schemas**. Each tool maps directly to an HTTP request against your app. Agents call them like built-in tools (`create_invoice(customer_id, amount_cents)`), which is dramatically more reliable than free-form HTTP.
+
+```json
+{
+  "connectors": [
+    {
+      "slug": "erp-api",
+      "name": "ERP API",
+      "auth_type": "platform_identity",
+      "base_path": "/api/v1",
+      "tools": [
+        {
+          "name": "create_invoice",
+          "description": "Create an invoice for a customer",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "customer_id": { "type": "string", "description": "Customer UUID" },
+              "amount_cents": { "type": "integer" },
+              "currency": { "type": "string", "enum": ["EUR", "USD"] }
+            },
+            "required": ["customer_id", "amount_cents"]
+          },
+          "request": {
+            "method": "POST",
+            "path": "/invoices",
+            "body": {
+              "customer": "{{customer_id}}",
+              "amount": "{{amount_cents}}",
+              "currency": "{{currency | default:'EUR'}}"
+            }
+          },
+          "response": { "extract": "$.invoice", "max_bytes": 16384 }
+        },
+        {
+          "name": "search_products",
+          "description": "Search the product catalog",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": { "type": "string" },
+              "limit": { "type": "integer" }
+            },
+            "required": ["query"]
+          },
+          "request": {
+            "method": "GET",
+            "path": "/products",
+            "query": { "q": "{{query}}", "limit": "{{limit | default:10}}" }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Rules:
+- `parameters` must be a valid JSON Schema object — arguments are validated before the request is made
+- `{{param}}` placeholders reference schema properties; they are escaped per context (URL-encoded in `path`/`query`, JSON-encoded in `body`)
+- Only simple filters are allowed: `default:<literal>`, `urlencode`. No expressions or logic — keep computation in your app. (`urlencode` is only needed for placeholders embedded inside larger strings; whole-value path/query params are auto-encoded)
+- A placeholder that is the entire value of a JSON string in `body` keeps its schema type (`"amount": "{{amount_cents}}"` produces an integer, not a string)
+- `request.path` is relative to `base_path`
+- Tool `description` matters a lot: write it for an LLM (what it does, when to use it). Names use `snake_case`; `list_tools` and `call` are reserved. The platform namespaces exposed names with the connector's namespaced slug (normalized to `[a-z0-9_]`), e.g. `{subdomain}__{slug}__{name}`
+- Keep it to the ~5–20 most useful operations; don't dump every endpoint
+- `response.extract` (JSONPath) and `response.max_bytes` keep tool results small — agents don't need full payloads
+
+Once ADR-0033 ships (or when the user asks to prepare for it), **generate `tools` entries from the detected API routes** (see "Detecting API Routes" below): operation → tool name, route params/body → JSON Schema.
+
+### MCP Connectors
+
+For connectors that need real logic (pagination, aggregation, multi-step operations, non-HTTP backends), the app can expose an **MCP server** (streamable HTTP) instead of declarative tools:
+
+```json
+{
+  "connectors": [
+    {
+      "slug": "erp-tools",
+      "name": "ERP Tools",
+      "protocol": "mcp",
+      "mcp_path": "/mcp",
+      "auth_type": "platform_identity"
+    }
+  ]
+}
+```
+
+- The platform calls `tools/list` on your MCP endpoint and exposes the returned tools to granted agents; tool calls are proxied via `tools/call`
+- Requests arrive through the identity proxy, so your MCP server receives `X-Webauth-*` headers identifying the acting user
+- Only MCP **tools** are supported (not resources/prompts)
+- Changing your tool list requires workspace-admin re-approval before agents see new/changed tools — keep tool definitions stable
+- Recommended scaffolding: FastMCP (Python) or the official TypeScript SDK, mounted at `/mcp` in the same service or as a sidecar service
+
+Prefer declarative `tools` for plain REST wrapping; reach for MCP when tools need code.
+
 ### Detecting API Routes
 
 When analyzing a codebase, look for API routes to auto-generate the `connectors` section:
@@ -1526,6 +1628,8 @@ Map route patterns to scopes:
 - [ ] App reads `X-Webauth-*` headers for `platform_identity` connectors (same as SSO)
 - [ ] Scopes are descriptive and follow `resource:action` pattern
 - [ ] For `api_key` connectors: `help_text` explains how to get a key
+- [ ] *(Once ADR-0033 ships)* If declaring named `tools`: each has a valid JSON Schema in `parameters`, an LLM-friendly `description`, `snake_case` names, and `{{param}}` placeholders matching schema properties
+- [ ] *(Once ADR-0033 ships)* For `protocol: mcp` connectors: MCP endpoint reachable at `mcp_path`, tools only, stable tool list
 
 ## Icon Color Palette
 
