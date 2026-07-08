@@ -11,6 +11,14 @@ argument-hint: "[optional: path to repo or description of the app]"
 ---
 
 <!--
+  SOURCE OF TRUTH: https://github.com/Lunar-Rails/n0-app-skill (SKILL.md)
+  This file is mirrored to clovrlabs/n0 at
+  django_backend/sandbox/templates/skills/n0-app/SKILL.md.
+  Make changes in the Lunar-Rails/n0-app-skill repo first, then sync the
+  mirror. The two files must stay byte-identical below the frontmatter.
+-->
+
+<!--
   SOURCE OF TRUTH: https://github.com/Lunar-Rails/n0-app-skill
   All other copies (N0 sandbox template django_backend/sandbox/templates/skills/n0-app/,
   local ~/.claude/skills installs) are mirrors. Edit on GitHub, then sync mirrors.
@@ -604,6 +612,7 @@ name: Build and Push Docker Image
 on:
   push:
     branches: [DETECT_DEFAULT_BRANCH]
+    tags: ['v*', 'release-*']
 
 env:
   IMAGE: ${{ vars.REGISTRY }}/LOWERCASE_ORG/LOWERCASE_REPO
@@ -619,13 +628,24 @@ jobs:
 
       - name: Build and push Docker image
         run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
           docker build \
             --build-arg VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }} \
             --build-arg VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }} \
             -t ${{ env.IMAGE }}:latest \
-            -t ${{ env.IMAGE }}:${{ github.sha }} .
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            -t ${{ env.IMAGE }}:${SHORT_SHA} .
           docker push ${{ env.IMAGE }}:latest
           docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:${SHORT_SHA}
+          # Human-friendly release tag: when triggered by a git tag
+          # (e.g. `git tag v1.2.0 && git push origin v1.2.0`), also push
+          # the image under that name so deploys can reference it.
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+            docker tag ${{ env.IMAGE }}:latest ${{ env.IMAGE }}:${RELEASE_TAG}
+            docker push ${{ env.IMAGE }}:${RELEASE_TAG}
+          fi
 
       # Only include this step if the runner has the k3s binary (host-mode runners).
       # Containerized runners fail here with exit 127 "k3s: command not found" —
@@ -646,7 +666,8 @@ jobs:
 - **NEVER use `${{ github.repository }}` directly in Docker image tags** — it preserves the original case (e.g., `clovrlabs/UI-TARS-desktop`) and Docker rejects uppercase. Always use a hardcoded lowercase `IMAGE` env var instead
 - Both workflows use `docker login ${{ vars.REGISTRY }}` with org-level secrets `REGISTRY_USER` and `REGISTRY_PASSWORD` to authenticate with this workspace's Gitea container registry. The `REGISTRY` **variable** plus these two **secrets** are auto-provisioned at the org level for every workspace, so any new repo inherits them automatically — never hardcode the registry hostname
 - Workflow B uses `actions/checkout@v4` for cloning — do NOT use manual `git clone` with hardcoded runner-internal URLs
-- Two tags are pushed: `latest` (for the manifest) and either the commit SHA (for rollback) or the upstream tag (for version tracking)
+- Tags pushed: `latest` (for the manifest), the full commit SHA **and** the 7-char short SHA (for rollback / redeploys — the platform resolves short SHAs to full ones, but pushing both keeps refs unambiguous), plus the git tag name for tagged releases
+- **Prefer human-friendly release tags for deploys**: create a git tag (`git tag v1.2.0 && git push origin v1.2.0`, or descriptive ones like `release-powerups`) and pass that name as `image_tag` when redeploying — it reads better in deploy history than a bare SHA
 - **Workflow B should include `docker save | k3s ctr images import` when the runner supports it** — this imports the image directly into k3s containerd, ensuring it's available for pod scheduling even before skopeo mirroring runs. **Not all workspaces have host-mode runners**: on containerized runners the step fails with exit 127 (`k3s: command not found`). Check the runner first, or just rely on commit-SHA image pinning in the manifest (see the Redeploy section) which works everywhere
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
 - The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
