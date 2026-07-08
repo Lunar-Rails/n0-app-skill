@@ -1426,7 +1426,7 @@ For apps that have their own authentication system and can't use reverse proxy a
 | `help_url_path` | No | string | Relative path to help page within the app (must start with `/`) |
 | `tools` | No | object[] | *(Pending ADR-0033, not yet live)* Named agent tools with JSON Schemas (see "Declarative Tools" below) |
 | `protocol` | No | string | *(Pending ADR-0033, not yet live)* `http` (default) or `mcp` (see "MCP Connectors" below) |
-| `mcp_path` | No | string | *(Pending ADR-0033, not yet live)* Path of the MCP streamable-HTTP endpoint (default `/mcp`) |
+| `mcp_path` | No | string | *(Pending ADR-0033, not yet live)* Path of the MCP streamable HTTP endpoint (default `/mcp`) |
 
 ### Example: Platform Identity Connector
 
@@ -1586,7 +1586,7 @@ Rules:
 - Only simple filters are allowed: `default:<literal>`, `urlencode`. No expressions or logic — keep computation in your app. (`urlencode` is only needed for placeholders embedded inside larger strings; whole-value path/query params are auto-encoded)
 - A placeholder that is the entire value of a JSON string in `body` keeps its schema type (`"amount": "{{amount_cents}}"` produces an integer, not a string)
 - `request.path` is relative to `base_path`
-- Tool `description` matters a lot: write it for an LLM (what it does, when to use it). Names use `snake_case`; `list_tools` and `call` are reserved. The platform namespaces exposed names with the connector's namespaced slug (normalized to `[a-z0-9_]`), e.g. `{subdomain}__{slug}__{name}`
+- Tool `description` matters a lot: write it for an LLM (what it does, when to use it). Names use `snake_case`; `list_tools` and `call` are reserved. Exposed tool names are prefixed with the connector's namespaced slug (`{subdomain}--{slug}`, see above) normalized to `[a-z0-9_]` — i.e. `--` becomes `__` — followed by `__` and the tool name: `{subdomain}__{slug}__{name}`
 - Keep it to the ~5–20 most useful operations; don't dump every endpoint
 - `response.extract` (JSONPath) and `response.max_bytes` keep tool results small — agents don't need full payloads
 
