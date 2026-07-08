@@ -1,0 +1,14 @@
+name: Security Review
+
+on:
+  pull_request:
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  security-review:
+    uses: Lunar-Rails/security-actions/.github/workflows/claude-security-review.yml@main
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
