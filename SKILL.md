@@ -11,6 +11,14 @@ argument-hint: "[optional: path to repo or description of the app]"
 ---
 
 <!--
+  SOURCE OF TRUTH: https://github.com/Lunar-Rails/n0-app-skill (SKILL.md)
+  This file is mirrored to clovrlabs/n0 at
+  django_backend/sandbox/templates/skills/n0-app/SKILL.md.
+  Make changes in the Lunar-Rails/n0-app-skill repo first, then sync the
+  mirror. The two files must stay byte-identical below the frontmatter.
+-->
+
+<!--
   SOURCE OF TRUTH: https://github.com/Lunar-Rails/n0-app-skill
   All other copies (N0 sandbox template django_backend/sandbox/templates/skills/n0-app/,
   local ~/.claude/skills installs) are mirrors. Edit on GitHub, then sync mirrors.
@@ -604,6 +612,7 @@ name: Build and Push Docker Image
 on:
   push:
     branches: [DETECT_DEFAULT_BRANCH]
+    tags: ['v*', 'release-*']
 
 env:
   IMAGE: ${{ vars.REGISTRY }}/LOWERCASE_ORG/LOWERCASE_REPO
@@ -619,13 +628,24 @@ jobs:
 
       - name: Build and push Docker image
         run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
           docker build \
             --build-arg VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }} \
             --build-arg VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }} \
             -t ${{ env.IMAGE }}:latest \
-            -t ${{ env.IMAGE }}:${{ github.sha }} .
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            -t ${{ env.IMAGE }}:${SHORT_SHA} .
           docker push ${{ env.IMAGE }}:latest
           docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:${SHORT_SHA}
+          # Human-friendly release tag: when triggered by a git tag
+          # (e.g. `git tag v1.2.0 && git push origin v1.2.0`), also push
+          # the image under that name so deploys can reference it.
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+            docker tag ${{ env.IMAGE }}:latest ${{ env.IMAGE }}:${RELEASE_TAG}
+            docker push ${{ env.IMAGE }}:${RELEASE_TAG}
+          fi
 
       # Only include this step if the runner has the k3s binary (host-mode runners).
       # Containerized runners fail here with exit 127 "k3s: command not found" —
@@ -646,7 +666,8 @@ jobs:
 - **NEVER use `${{ github.repository }}` directly in Docker image tags** — it preserves the original case (e.g., `clovrlabs/UI-TARS-desktop`) and Docker rejects uppercase. Always use a hardcoded lowercase `IMAGE` env var instead
 - Both workflows use `docker login ${{ vars.REGISTRY }}` with org-level secrets `REGISTRY_USER` and `REGISTRY_PASSWORD` to authenticate with this workspace's Gitea container registry. The `REGISTRY` **variable** plus these two **secrets** are auto-provisioned at the org level for every workspace, so any new repo inherits them automatically — never hardcode the registry hostname
 - Workflow B uses `actions/checkout@v4` for cloning — do NOT use manual `git clone` with hardcoded runner-internal URLs
-- Two tags are pushed: `latest` (for the manifest) and either the commit SHA (for rollback) or the upstream tag (for version tracking)
+- Tags pushed: `latest` (for the manifest), the full commit SHA **and** the 7-char short SHA (for rollback / redeploys — the platform resolves short SHAs to full ones, but pushing both keeps refs unambiguous), plus the git tag name for tagged releases
+- **Prefer human-friendly release tags for deploys**: create a git tag (`git tag v1.2.0 && git push origin v1.2.0`, or descriptive ones like `release-powerups`) and pass that name as `image_tag` when redeploying — it reads better in deploy history than a bare SHA
 - **Workflow B should include `docker save | k3s ctr images import` when the runner supports it** — this imports the image directly into k3s containerd, ensuring it's available for pod scheduling even before skopeo mirroring runs. **Not all workspaces have host-mode runners**: on containerized runners the step fails with exit 127 (`k3s: command not found`). Check the runner first, or just rely on commit-SHA image pinning in the manifest (see the Redeploy section) which works everywhere
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
 - The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
@@ -1403,6 +1424,9 @@ For apps that have their own authentication system and can't use reverse proxy a
 | `scopes` | No | string[] | Available scopes (informational, displayed in UI) |
 | `help_text` | No | string | Help text shown when connecting (useful for `api_key` type) |
 | `help_url_path` | No | string | Relative path to help page within the app (must start with `/`) |
+| `tools` | No | object[] | *(Pending ADR-0033, not yet live)* Named agent tools with JSON Schemas (see "Declarative Tools" below) |
+| `protocol` | No | string | *(Pending ADR-0033, not yet live)* `http` (default) or `mcp` (see "MCP Connectors" below) |
+| `mcp_path` | No | string | *(Pending ADR-0033, not yet live)* Path of the MCP streamable HTTP endpoint (default `/mcp`) |
 
 ### Example: Platform Identity Connector
 
@@ -1495,6 +1519,105 @@ An app can publish multiple connectors (e.g., separate read/write APIs):
 }
 ```
 
+### Declarative Tools (Named Agent Tools)
+
+> **Status: not yet live.** Declarative `tools` (and MCP connectors below) are specified in ADR-0033 and pending platform implementation. Until the platform ships support, `tools`, `protocol`, and `mcp_path` entries are ignored by `sync_app_connectors()` — declare them only if the user asks to prepare for it, and tell the user they are not active yet. Do not claim named tools work today.
+
+Instead of only declaring a `base_path` (which forces the agent to guess your API's shape), declare **named tools with JSON Schemas**. Each tool maps directly to an HTTP request against your app. Agents call them like built-in tools (`create_invoice(customer_id, amount_cents)`), which is dramatically more reliable than free-form HTTP.
+
+```json
+{
+  "connectors": [
+    {
+      "slug": "erp-api",
+      "name": "ERP API",
+      "auth_type": "platform_identity",
+      "base_path": "/api/v1",
+      "tools": [
+        {
+          "name": "create_invoice",
+          "description": "Create an invoice for a customer",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "customer_id": { "type": "string", "description": "Customer UUID" },
+              "amount_cents": { "type": "integer" },
+              "currency": { "type": "string", "enum": ["EUR", "USD"] }
+            },
+            "required": ["customer_id", "amount_cents"]
+          },
+          "request": {
+            "method": "POST",
+            "path": "/invoices",
+            "body": {
+              "customer": "{{customer_id}}",
+              "amount": "{{amount_cents}}",
+              "currency": "{{currency | default:'EUR'}}"
+            }
+          },
+          "response": { "extract": "$.invoice", "max_bytes": 16384 }
+        },
+        {
+          "name": "search_products",
+          "description": "Search the product catalog",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": { "type": "string" },
+              "limit": { "type": "integer" }
+            },
+            "required": ["query"]
+          },
+          "request": {
+            "method": "GET",
+            "path": "/products",
+            "query": { "q": "{{query}}", "limit": "{{limit | default:10}}" }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Rules:
+- `parameters` must be a valid JSON Schema object — arguments are validated before the request is made
+- `{{param}}` placeholders reference schema properties; they are escaped per context (URL-encoded in `path`/`query`, JSON-encoded in `body`)
+- Only simple filters are allowed: `default:<literal>`, `urlencode`. No expressions or logic — keep computation in your app. (`urlencode` is only needed for placeholders embedded inside larger strings; whole-value path/query params are auto-encoded)
+- A placeholder that is the entire value of a JSON string in `body` keeps its schema type (`"amount": "{{amount_cents}}"` produces an integer, not a string)
+- `request.path` is relative to `base_path`
+- Tool `description` matters a lot: write it for an LLM (what it does, when to use it). Names use `snake_case`; `list_tools` and `call` are reserved. Exposed tool names are prefixed with the connector's namespaced slug (`{subdomain}--{slug}`, see above) normalized to `[a-z0-9_]` — i.e. `--` becomes `__` — followed by `__` and the tool name: `{subdomain}__{slug}__{name}`
+- Keep it to the ~5–20 most useful operations; don't dump every endpoint
+- `response.extract` (JSONPath) and `response.max_bytes` keep tool results small — agents don't need full payloads
+
+Once ADR-0033 ships (or when the user asks to prepare for it), **generate `tools` entries from the detected API routes** (see "Detecting API Routes" below): operation → tool name, route params/body → JSON Schema.
+
+### MCP Connectors
+
+For connectors that need real logic (pagination, aggregation, multi-step operations, non-HTTP backends), the app can expose an **MCP server** (streamable HTTP) instead of declarative tools:
+
+```json
+{
+  "connectors": [
+    {
+      "slug": "erp-tools",
+      "name": "ERP Tools",
+      "protocol": "mcp",
+      "mcp_path": "/mcp",
+      "auth_type": "platform_identity"
+    }
+  ]
+}
+```
+
+- The platform calls `tools/list` on your MCP endpoint and exposes the returned tools to granted agents; tool calls are proxied via `tools/call`
+- Requests arrive through the identity proxy, so your MCP server receives `X-Webauth-*` headers identifying the acting user
+- Only MCP **tools** are supported (not resources/prompts)
+- Changing your tool list requires workspace-admin re-approval before agents see new/changed tools — keep tool definitions stable
+- Recommended scaffolding: FastMCP (Python) or the official TypeScript SDK, mounted at `/mcp` in the same service or as a sidecar service
+
+Prefer declarative `tools` for plain REST wrapping; reach for MCP when tools need code.
+
 ### Detecting API Routes
 
 When analyzing a codebase, look for API routes to auto-generate the `connectors` section:
@@ -1526,6 +1649,8 @@ Map route patterns to scopes:
 - [ ] App reads `X-Webauth-*` headers for `platform_identity` connectors (same as SSO)
 - [ ] Scopes are descriptive and follow `resource:action` pattern
 - [ ] For `api_key` connectors: `help_text` explains how to get a key
+- [ ] *(Once ADR-0033 ships)* If declaring named `tools`: each has a valid JSON Schema in `parameters`, an LLM-friendly `description`, `snake_case` names, and `{{param}}` placeholders matching schema properties
+- [ ] *(Once ADR-0033 ships)* For `protocol: mcp` connectors: MCP endpoint reachable at `mcp_path`, tools only, stable tool list
 
 ## Icon Color Palette
 
