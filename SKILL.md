@@ -887,10 +887,117 @@ For apps needing caching or session storage.
 }
 ```
 
+### App Data — per-app isolated Supabase schema (recommended for app-owned data)
+
+If your app just needs its own tables (leaderboards, waitlists, settings, price
+history…), **do not deploy your own Postgres/Supabase stack** and do not share
+the workspace-wide credentials. Instead, declare in `n0-app.json` (top level):
+
+```json
+{
+  "name": "Snake",
+  "slug": "snake-game",
+  "app_data": true,
+  "entrypoint": "web",
+  "services": { "web": { "...": "..." } }
+}
+```
+
+At deploy time the platform provisions (idempotently) an isolated Postgres
+schema `app_<slug>_<appid6>` on the workspace's Supabase instance, owned by a
+dedicated NOLOGIN role, and injects credentials into **every** service
+container:
+
+| Env var | Meaning |
+|---------|---------|
+| `N0_APP_SUPABASE_URL` | Workspace Supabase API URL (Kong gateway) |
+| `N0_APP_SUPABASE_TOKEN` | PostgREST JWT bound to the app's role (rotated every deploy) |
+| `N0_APP_SUPABASE_ANON_KEY` | Anon key — send as the `apikey` header |
+| `N0_APP_SUPABASE_SCHEMA` | Schema name — send as `Accept-Profile` (reads) / `Content-Profile` (writes) |
+
+Example (server-side, Node — see the real thing in `lunarrails/snake-game`):
+
+```js
+const SB = {
+  url: process.env.N0_APP_SUPABASE_URL,
+  token: process.env.N0_APP_SUPABASE_TOKEN,
+  anonKey: process.env.N0_APP_SUPABASE_ANON_KEY,
+  schema: process.env.N0_APP_SUPABASE_SCHEMA,
+};
+
+// Read
+await fetch(`${SB.url}/rest/v1/leaderboard?select=*&order=score.desc`, {
+  headers: {
+    apikey: SB.anonKey,
+    Authorization: `Bearer ${SB.token}`,
+    'Accept-Profile': SB.schema,
+  },
+});
+
+// Upsert (PK = email)
+await fetch(`${SB.url}/rest/v1/leaderboard?on_conflict=email`, {
+  method: 'POST',
+  headers: {
+    apikey: SB.anonKey,
+    Authorization: `Bearer ${SB.token}`,
+    'Content-Profile': SB.schema,
+    'Content-Type': 'application/json',
+    Prefer: 'resolution=merge-duplicates',
+  },
+  body: JSON.stringify({ email, name, score }),
+});
+```
+
+**Isolation guarantees:**
+- The app role only sees its own schema — other apps' schemas and workspace
+  members' private `u_*` schemas are invisible, and vice versa.
+- The token is scoped to the app role and rotated on every deploy; never log it.
+- Workspace admins, the app owner, and app collaborators can browse the app's
+  tables read-only via the Studio **Data** tab. Other members cannot.
+
+**Creating tables — deploy-time migrations:** PostgREST does not do DDL, so
+your app cannot `CREATE TABLE` through `N0_APP_SUPABASE_URL`. Instead, ship
+SQL migration files in your repo and the platform runs them automatically at
+every deploy/redeploy:
+
+```
+migrations/001_init.sql        # applied in filename order — prefix 001_, 002_, ...
+migrations/002_add_column.sql
+migration.sql                  # OR: a single file at the repo root (applied first)
+```
+
+Example `migrations/001_init.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS leaderboard (
+  email text PRIMARY KEY,
+  name  text NOT NULL DEFAULT '',
+  score integer NOT NULL CHECK (score > 0),
+  date  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Rules:
+- No schema prefix needed — `search_path` is pinned to your app's schema.
+- Migrations run **as your app's own schema-confined role** (not as admin):
+  they can only create/alter objects inside your app schema. `SET ROLE`,
+  `CREATE EXTENSION`, touching other schemas, etc. will simply fail.
+- **Append-only**: each file is applied exactly once (tracked by content hash
+  in `_n0_migrations` inside your schema). Editing an already-applied file is
+  ignored — add a new numbered file instead. Use `IF NOT EXISTS` for safety.
+- Per-file transaction, 60s statement timeout, 256KB max per file. A failed
+  migration is logged and skipped (later files are not run) but never fails
+  the deploy — check the app logs / Data tab if tables are missing.
+- New tables are exposed to PostgREST automatically (schema cache reload).
+
+Local dev: the `N0_APP_SUPABASE_*` vars are absent outside the platform — keep
+a simple fallback (JSON file, SQLite) so the app still runs locally.
+
 ### Using the Workspace Supabase (simpler alternative)
 
 If the workspace already has a running Supabase instance (most do), your app can use it
-directly instead of deploying its own. This is the **recommended approach for simple CRUD apps**.
+directly instead of deploying its own. This is only appropriate for **frontend-only
+apps using the anon key**; for app-owned server-side data prefer **App Data** above.
 
 1. The Supabase API URL follows the pattern: `https://supabase-api-{workspace-slug}.apps.{domain}`
 2. The anon key is available as an org-level Gitea Actions secret: `VITE_SUPABASE_ANON_KEY`
