@@ -955,25 +955,40 @@ await fetch(`${SB.url}/rest/v1/leaderboard?on_conflict=email`, {
 - Workspace admins, the app owner, and app collaborators can browse the app's
   tables read-only via the Studio **Data** tab. Other members cannot.
 
-**Creating tables (important):** PostgREST does not do DDL, so your app cannot
-`CREATE TABLE` through `N0_APP_SUPABASE_URL`. Get tables created one of these ways:
-1. Ask a workspace agent to run the SQL (agents have Supabase SQL tools), or
-2. Have a platform admin run it against the workspace Supabase Postgres as the
-   app role, e.g.:
-   ```sql
-   SET ROLE app_snake_game_68db2d;
-   CREATE TABLE IF NOT EXISTS app_snake_game_68db2d.leaderboard (
-     email text PRIMARY KEY,
-     name  text NOT NULL DEFAULT '',
-     score integer NOT NULL CHECK (score > 0),
-     date  timestamptz NOT NULL DEFAULT now()
-   );
-   RESET ROLE;
-   NOTIFY pgrst, 'reload schema';
-   ```
-   (`SET ROLE` ensures the app role owns the table so PostgREST writes work.)
+**Creating tables — deploy-time migrations:** PostgREST does not do DDL, so
+your app cannot `CREATE TABLE` through `N0_APP_SUPABASE_URL`. Instead, ship
+SQL migration files in your repo and the platform runs them automatically at
+every deploy/redeploy:
 
-Include a `migration.sql` in your repo documenting the expected tables.
+```
+migrations/001_init.sql        # applied in filename order — prefix 001_, 002_, ...
+migrations/002_add_column.sql
+migration.sql                  # OR: a single file at the repo root (applied first)
+```
+
+Example `migrations/001_init.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS leaderboard (
+  email text PRIMARY KEY,
+  name  text NOT NULL DEFAULT '',
+  score integer NOT NULL CHECK (score > 0),
+  date  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Rules:
+- No schema prefix needed — `search_path` is pinned to your app's schema.
+- Migrations run **as your app's own schema-confined role** (not as admin):
+  they can only create/alter objects inside your app schema. `SET ROLE`,
+  `CREATE EXTENSION`, touching other schemas, etc. will simply fail.
+- **Append-only**: each file is applied exactly once (tracked by content hash
+  in `_n0_migrations` inside your schema). Editing an already-applied file is
+  ignored — add a new numbered file instead. Use `IF NOT EXISTS` for safety.
+- Per-file transaction, 60s statement timeout, 256KB max per file. A failed
+  migration is logged and skipped (later files are not run) but never fails
+  the deploy — check the app logs / Data tab if tables are missing.
+- New tables are exposed to PostgREST automatically (schema cache reload).
 
 Local dev: the `N0_APP_SUPABASE_*` vars are absent outside the platform — keep
 a simple fallback (JSON file, SQLite) so the app still runs locally.
