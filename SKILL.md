@@ -505,8 +505,18 @@ Apps can reference other running apps in their environment variables using the `
 | Pattern | Resolves To | Example |
 |---------|-------------|---------|
 | `{{APP:gitea:URL}}` | Public URL of the app | `https://gitea.apps.privateprompt.tech` |
-| `{{APP:gitea:INTERNAL}}` | Docker-internal hostname | `gitea-gitea` (container name) |
-| `{{APP:gitea:PORT}}` | Container port as string | `3000` |
+| `{{APP:gitea:INTERNAL}}` | In-cluster/internal address (see below) | `http://app-gitea.n0-ws.svc.cluster.local:3000` |
+| `{{APP:gitea:PORT}}` | Port as string | `3000` |
+
+`INTERNAL` resolves per deployment backend:
+- **K8s apps** (default on all instances): `http://<service>.<namespace>.svc.cluster.local:<container_port>` — the app's ClusterIP Service DNS. `PORT` is the container port.
+- **Docker apps** (legacy): `http://172.17.0.1:<host_port>` — the Docker bridge gateway. `PORT` is the host port.
+
+**Use `INTERNAL` for server-to-server calls between apps.** Public app URLs
+(`{{APP:<slug>:URL}}`) sit behind Caddy forward_auth when the target app's
+`access_level` is `workspace`/`private`, so backend HTTP calls to them get a
+302 to the login page. The `INTERNAL` address bypasses the auth proxy entirely
+(in-cluster traffic between hosted apps is permitted).
 
 **Example usage in a manifest:**
 ```json
