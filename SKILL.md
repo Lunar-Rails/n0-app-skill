@@ -2092,6 +2092,10 @@ The deploy is async — a background Huey task:
 
 ### Step 3: Redeploy (after code changes)
 
+> **Prefer previews for running apps:** instead of redeploying straight to
+> production, deploy the new build as a preview, verify it, then promote —
+> see [Preview Deployments](#preview-deployments-test-a-build-before-production).
+
 For zero-build (config_files) apps, **re-import the definition first** so the platform picks up the new `n0-app.json` from Gitea, then redeploy:
 
 ```bash
@@ -2132,6 +2136,48 @@ take effect at the Caddy layer after a redeploy.
 - Only pass `{"image_tag": "..."}` when you explicitly want to deploy a different **image** tag of a custom-built image; version labels are NOT image tags
 
 Practical rule for zero-build apps: since the "version" lives in the manifest (ConfigMaps), always push a Gitea commit per change and re-import before redeploying — that commit sha becomes the deploy's version tag and enables rollback.
+
+### Preview Deployments (test a build before production)
+
+**Never test a new build by redeploying production.** For a RUNNING app, deploy the
+new image tag as a **preview** first — a second, ephemeral instance at
+`<subdomain>-pv-N.apps.<domain>` with **fresh, empty data** — verify it, then promote:
+
+```bash
+# 1. Deploy a preview of a new build (image_tag is required — use the CI-built
+#    commit-SHA tag or a release tag, never :latest)
+curl -s -X POST "$N0_API_BASE/workspaces/${WS_ID}/apps/${APP_ID}/previews" \
+  -H "Authorization: Bearer $N0_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"image_tag": "abc1234"}'
+# → 201 with the preview app JSON (note its "id" and "subdomain": <parent>-pv-1)
+
+# Optional body fields: "ttl_hours" (default 48, max 168) and
+# "access_level" (default "admin" — the preview is locked down, NOT public)
+
+# 2. List active previews of an app
+curl -s "$N0_API_BASE/workspaces/${WS_ID}/apps/${APP_ID}/previews" \
+  -H "Authorization: Bearer $N0_API_TOKEN"
+
+# 3. Verify the preview (its URL is https://<parent>-pv-N.apps.<domain>),
+#    then promote it — the PARENT is redeployed with the preview's tested
+#    image tag + manifest snapshot, and the preview is destroyed:
+curl -s -X POST "$N0_API_BASE/workspaces/${WS_ID}/apps/${PREVIEW_ID}/promote" \
+  -H "Authorization: Bearer $N0_API_TOKEN"
+
+# Or discard it without promoting:
+curl -s -X DELETE "$N0_API_BASE/workspaces/${WS_ID}/apps/${PREVIEW_ID}" \
+  -H "Authorization: Bearer $N0_API_TOKEN"
+```
+
+Rules and gotchas:
+
+- Previews require `apps:write`; only the app owner, collaborators, or workspace admins can create/promote them
+- **Zero-build (config_files) apps:** push the commit and re-import the definition FIRST (same as a redeploy) — the preview snapshots the definition's manifest at creation, and promote deploys exactly that snapshot
+- Limits: **2 active previews per app, 5 per workspace**; previews auto-expire after their TTL (default 48h) and are destroyed by the platform
+- Previews get reduced resources (1 CPU / 1Gi limits) and start with **empty data** — they never see production data
+- **Secrets are shared with production** (the Vault path is per app type): changing a secret affects both, so don't test destructive secret changes via a preview
+- Previews cannot be created for core apps, personal apps, or other previews
+- Promote requires the preview to be RUNNING; a failed preview should be deleted, fixed, and re-created
 
 ### Other Operations
 
