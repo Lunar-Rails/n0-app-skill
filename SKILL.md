@@ -2046,7 +2046,18 @@ After generating the manifest and pushing code to Gitea, the app must be **impor
 
 **API response envelope:** all N0 API responses are wrapped as `{"success": true, "data": {...}}` — read fields from `data`, not the top level.
 
-**Verifying a deployed (workspace-gated) app from the CLI:** apps behind SSO can be curled by appending an iframe token: `TOK=$(curl -s -H "Authorization: Bearer $TOKEN" "https://app.../api/v1/apps/iframe-token" | python3 -c "import json,sys;print(json.load(sys.stdin)['data']['token'])")` then `curl "https://my-app.apps.../?_ppauth=$TOK"`. Add a cache-buster query param when verifying fresh deploys.
+**⚠️ NEVER `curl` a deployed app's public URL directly** (e.g. `https://my-app.apps.*.nzero.pro/`) — most apps have `access_level: "workspace"` (the default), which means Caddy's forward_auth will block or redirect the request, causing curl to **hang indefinitely**. This is the #1 cause of stuck agent loops.
+
+**Verifying a deployed (workspace-gated) app from the CLI:** use an iframe token to bypass forward_auth:
+```bash
+TOK=$(curl -s --max-time 10 -H "Authorization: Bearer $N0_API_TOKEN" \
+  "$N0_API_BASE/apps/iframe-token" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['data']['token'])")
+curl -s --max-time 10 "https://my-app.apps.DOMAIN/?_ppauth=$TOK&_cb=$(date +%s)"
+```
+Add `--max-time 10` to ALL curl commands to prevent hangs. Add a cache-buster query param (`_cb`) when verifying fresh deploys.
+
+**If the app is `access_level: "public"`**, direct curl works without a token.
 
 ### Step 1: Import App Definition
 
