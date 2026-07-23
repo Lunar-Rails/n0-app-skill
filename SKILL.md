@@ -302,6 +302,8 @@ Key points:
 - **No Dockerfile, no Gitea Actions workflow, no registry** — skip Steps 2b and 5 entirely
 - Store app state in a **persistent volume** (e.g. `/data/db.json`) — the config_files volume is recreated on every deploy
 - Binary assets (images, audio) can be embedded as base64 strings and decoded by the server at startup
+- **Match Node module syntax to the effective `package.json`**: if a `package.json` with `"type": "module"` is present on the volume (or in the working directory), plain `.js` files are ESM — `require()` throws `ReferenceError: require is not defined`. Use `import` syntax, or pin the interpretation explicitly by naming the entry `server.cjs` (CommonJS) / `server.mjs` (ESM). When in doubt, pin with the extension.
+- **Run embedded files before embedding them**: execute the real source file with the same Node/Python major version as the service image (`node server.js`, `python3 app.py`) and hit it once (e.g. `curl`) before regenerating `n0-app.json` — a file that was never executed is the #1 source of broken zero-build deploys
 - The deploy loop is: edit source files → **regenerate `n0-app.json`** (script that reads the files and patches `services.web.config_files.app`) → push both to Gitea → re-import the definition (`POST .../apps/definitions/` with `{"repo_url": ...}`) → `POST .../apps/{id}/redeploy` with `{}`
 - **Never hand-edit the embedded copies inside n0-app.json** — always regenerate from the real source files, e.g.:
   ```python
@@ -1963,6 +1965,8 @@ Before finalizing, verify:
 - [ ] Migration/init services are defined for apps that need DB setup before starting
 - [ ] Environment variables use `{{APP_URL}}` / `{{APP_DOMAIN}}` where needed
 - [ ] **Env vars and paths were verified against the upstream self-host compose** or container inspection — NEVER guessed
+- [ ] **Generated code was actually executed before finalizing** — run scripts/servers with the same runtime version as the service image and hit them once (`curl`/CLI); catches ESM/CJS mismatches (`"type": "module"` makes `require()` throw — use `import` or a `.cjs` entry) and other never-run breakage
+- [ ] **Scripts that read input files were tested against a small generated fixture** (create a representative test file, run the script on it, check the output)
 - [ ] Dockerfile builds successfully (if custom image needed)
 - [ ] `.dockerignore` excludes `node_modules`, `.git`, etc. (if custom Dockerfile)
 - [ ] No real secrets in the manifest (use dict format or empty placeholders -- secrets are managed via UI or Vault)
