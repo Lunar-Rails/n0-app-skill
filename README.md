@@ -61,6 +61,20 @@ N0 deploys apps as Docker containers on Kubernetes (k3s), with:
 - **Vault secrets management** — secrets stored in HashiCorp Vault, injected at deploy time
 - **Caddy routing** — automatic TLS, DNS, and reverse proxy setup
 
+## N0 API
+
+The skill uses the N0 API via a Personal Access Token (PAT). The same token can also be used for other platform operations beyond app deployment:
+
+- **Channels & Messages** — post messages, read channels (`channels:read/write`)
+- **Boards & Tasks** — create/move tasks, manage columns (`boards:read/write`)
+- **Projects** — organize apps, agents, notes, boards into projects (`projects:read/write`)
+- **Notes** — create rich-text notes with ProseMirror JSON (`notes:read/write`)
+- **Connectors** — create custom tool connectors (`connectors:read/write`)
+- **Supabase** — query and execute SQL (`supabase:read/write`)
+- **Geocoding** — forward/reverse geocoding (`geo:read`)
+
+The API is self-describing — call `GET /api/v1/schema/` (no auth required) to discover all available endpoints, request formats, and scopes.
+
 ## License
 
 MIT

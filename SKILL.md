@@ -136,14 +136,53 @@ curl -s "$N0_API_BASE/../schema/"
 ```
 
 Returns all PAT-accessible endpoints grouped by resource (users, workspaces,
-channels, DMs, boards, apps, connectors, Gitea, Supabase, geocoding), including:
+channels, DMs, boards, projects, notes, apps, connectors, Gitea, Supabase,
+geocoding), including:
 - HTTP method, path, and required scope for each endpoint
 - Request body format with field descriptions
+- Response envelope format (`{"success": true, "data": ...}`)
 - Available scopes with descriptions
 - Getting-started guide
 
 **Use this first** when you have a PAT token and need to understand what the API
 offers. It replaces the need for separate API documentation.
+
+### Quick example: discover and use the API
+
+```bash
+# 1. Fetch the full schema (no auth required)
+curl -s "$N0_API_BASE/schema/" | python3 -m json.tool
+
+# 2. List your workspaces
+curl -s -H "Authorization: Bearer $N0_API_TOKEN" "$N0_API_BASE/workspaces/"
+
+# 3. Post a message to a channel
+curl -s -X POST -H "Authorization: Bearer $N0_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Hello from the API!"}' \
+  "$N0_API_BASE/channels/{channel_id}/messages/"
+
+# 4. Create a task on a board
+curl -s -X POST -H "Authorization: Bearer $N0_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"column_id": "{column_uuid}", "title": "New task", "priority": "medium"}' \
+  "$N0_API_BASE/workspaces/{wid}/boards/{board_id}/tasks"
+
+# 5. Create a note in a project
+curl -s -X POST -H "Authorization: Bearer $N0_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "My Note", "project": "{project_uuid}", "doc": {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Note body"}]}]}}' \
+  "$N0_API_BASE/workspaces/{wid}/notes/"
+
+# 6. Delete a message
+curl -s -X DELETE -H "Authorization: Bearer $N0_API_TOKEN" \
+  "$N0_API_BASE/messages/{message_id}/"
+```
+
+All responses use a consistent envelope: `{"success": true, "data": {...}}` on
+success, `{"success": false, "error": {"code": "...", "message": "..."}}` on
+failure. List endpoints nest arrays under a named key (e.g. `.data.boards`,
+`.data.notes`, `.data.columns`).
 
 ### Custom connector manifest schema
 
@@ -174,6 +213,10 @@ Returns the detailed manifest format for creating custom connectors, including:
 | `dms:write` | Create DMs and send direct messages |
 | `boards:read` | View boards, columns, and tasks |
 | `boards:write` | Create, update, move, and delete tasks |
+| `projects:read` | View projects, their items, members, and activity |
+| `projects:write` | Create, update, move, and delete projects and manage their items |
+| `notes:read` | Read notes and note revisions you have access to |
+| `notes:write` | Create, edit, move, and delete notes |
 | `apps:read` | List hosted apps and definitions |
 | `apps:write` | Deploy, redeploy, stop, and manage apps |
 | `connectors:read` | List custom connectors and their status |
