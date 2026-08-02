@@ -405,6 +405,21 @@ RUN printf 'server {\n\
 EXPOSE 80
 ```
 
+**GOTCHA: Native npm modules break `npm ci` on alpine/slim images.** Packages like
+`better-sqlite3`, `sqlite3`, `sharp`, `canvas`, and `bcrypt` compile C++ via node-gyp,
+which needs Python + a build toolchain that `node:*-alpine` / `node:*-slim` do NOT have.
+The build fails with `gyp ERR! find Python — Could not find any Python installation`.
+Before adding a toolchain, do this in order:
+1. **Audit dependencies first** — starter templates often carry unused native deps
+   (e.g. `better-sqlite3` in a static-site scaffold). If nothing imports the package,
+   DELETE it from `package.json` and run `npm install` to regenerate `package-lock.json`
+   (`npm ci` fails if the lockfile and `package.json` disagree).
+2. Only if the native module is genuinely needed, add the toolchain to the **build stage
+   only**: `RUN apk add --no-cache python3 make g++` (alpine) or
+   `RUN apt-get update && apt-get install -y python3 make g++` (slim/bookworm).
+3. Match the Node major version to the `engines` field in `package.json` — a mismatch
+   spews `EBADENGINE` warnings and can fail strict installs.
+
 #### Node.js (Express/Fastify/API server)
 ```dockerfile
 FROM node:20-alpine
@@ -780,6 +795,8 @@ jobs:
 
 **Notes (both workflows):**
 - The runner is `self-hosted` and has Docker available (runs on host, not in container)
+- **NEVER use `docker/login-action@v3` with `secrets.DOCKER_USERNAME` / `secrets.DOCKER_PASSWORD`** — those secrets do NOT exist in this platform and the step fails with `Error: Username and password required`. The ONLY valid login is the shell step shown in the templates: `echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ vars.REGISTRY }} -u "${{ secrets.REGISTRY_USER }}" --password-stdin`. Do not invent secret names; do not copy GitHub-flavored workflows from upstream repos without converting them
+- **After every push, verify the Actions run actually succeeded before reporting success** — check `GET https://<GITEA_HOST>/api/v1/repos/{org}/{repo}/actions/tasks` (or the repo's Actions tab) and confirm the latest run is green. A hosted app can show status `running` while serving a STALE image from an earlier build; only a green CI run followed by a redeploy updates it
 - **NEVER use `${{ github.repository }}` directly in Docker image tags** — it preserves the original case (e.g., `clovrlabs/UI-TARS-desktop`) and Docker rejects uppercase. Always use a hardcoded lowercase `IMAGE` env var instead
 - Both workflows use `docker login ${{ vars.REGISTRY }}` with org-level secrets `REGISTRY_USER` and `REGISTRY_PASSWORD` to authenticate with this workspace's Gitea container registry. The `REGISTRY` **variable** plus these two **secrets** are auto-provisioned at the org level for every workspace, so any new repo inherits them automatically — never hardcode the registry hostname
 - Workflow B uses `actions/checkout@v4` for cloning — do NOT use manual `git clone` with hardcoded runner-internal URLs
@@ -2311,6 +2328,16 @@ curl -X PUT -H "Authorization: token $ADMIN_TOKEN" \
 Here's the full workflow for developing an app locally and deploying it to N0:
 
 ### 1. Create a Gitea Repo
+
+**Create the repo under the workspace ORG from the start** (`POST /api/v1/orgs/{org}/repos`),
+NOT under your personal user account — org repos inherit the auto-provisioned Actions
+variables/secrets (`REGISTRY`, `REGISTRY_USER`, `REGISTRY_PASSWORD`); personal repos do not.
+
+**ONE repo per app — never two.** If a repo must be migrated (e.g. personal → org),
+do it once and completely: push all content to the new repo, update your local clone's
+`origin` remote (`git remote set-url origin <new-url>`), and archive or delete the old
+repo immediately. Maintaining two copies leads to fixes landing in one repo while CI
+fails in the other.
 
 First mint a Gitea token from the n0 API using your PAT (see "Authentication"
 above — HTTPS-only, sandbox-safe). `GITEA_TOKEN`, `GITEA_USER`, and `GITEA_HOST`
