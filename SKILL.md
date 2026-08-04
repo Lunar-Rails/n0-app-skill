@@ -36,6 +36,17 @@ Analyze a codebase and generate everything needed to deploy it as a hosted app o
 4. **Generates** a `.gitea/workflows/build-and-push.yml` Gitea Actions workflow (build from source OR mirror upstream images)
 5. **Validates** the output against N0's manifest schema
 
+## CRITICAL: Repo Location — Workspace Org Only
+
+**The app repo MUST live in the WORKSPACE ORG (e.g. `lunarrails/my-app`), NEVER in a
+personal user namespace (e.g. `rasmus/my-app`).** The Actions registry credentials
+(`REGISTRY` variable + `REGISTRY_USER`/`REGISTRY_PASSWORD` secrets) are auto-provisioned
+at the **org level only** — workflows in personal-namespace repos see empty `vars.REGISTRY`
+and cannot `docker login` or push images, so the build ALWAYS fails. Create the repo with
+`POST /api/v1/orgs/{org}/repos` (the in-app `gitea_create_repo` tool defaults to the
+workspace org). If a repo was created under a user by mistake, migrate it to the org
+once and completely (see "Complete Local Dev → Deploy Workflow" step 1).
+
 ## CRITICAL: Image References
 
 **N0 does NOT build Docker images. It only pulls pre-built images from registries.**
