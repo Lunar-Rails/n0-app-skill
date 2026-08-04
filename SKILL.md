@@ -888,12 +888,19 @@ jobs:
           fi
           git lfs install --skip-repo
 
-      # 2. lfs: true makes checkout resolve pointers into real file contents.
+      # 2. lfs: true makes checkout fetch the LFS objects.
       - uses: actions/checkout@v4
         with:
           lfs: true
 
-      # 3. Fail loudly if anything is still a pointer, rather than shipping
+      # 3. lfs: true runs `git lfs fetch` but does NOT reliably smudge objects
+      #    into the working tree -- observed leaving every media file as a
+      #    pointer even with git-lfs present in the job container. Materialise
+      #    them explicitly; this step is what actually makes the files real.
+      - name: Materialise LFS objects
+        run: git lfs pull
+
+      # 4. Fail loudly if anything is still a pointer, rather than shipping
       #    a green build full of 130-byte text stubs.
       - name: Verify LFS assets are real files
         run: |
