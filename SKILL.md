@@ -893,24 +893,36 @@ jobs:
         with:
           lfs: true
 
-      # 3. lfs: true runs `git lfs fetch` but does NOT reliably smudge objects
-      #    into the working tree -- observed leaving every media file as a
-      #    pointer even with git-lfs present in the job container. Materialise
-      #    them explicitly; this step is what actually makes the files real.
+      # 3. Belt and braces. Once git-lfs is installed the smudge filter already
+      #    materialises everything during checkout, so this is normally a ~1s
+      #    no-op -- cheap insurance against a runner image without the filter.
       - name: Materialise LFS objects
         run: git lfs pull
 
       # 4. Fail loudly if anything is still a pointer, rather than shipping
       #    a green build full of 130-byte text stubs.
+      #
+      #    Guard the test with `if`, NEVER `head | grep -q ... && echo`. Actions
+      #    runs every step under `bash -e -o pipefail`: a CLEAN file makes
+      #    `grep -q` exit 1, that becomes the while-loop's status, which becomes
+      #    the command substitution's status, and `set -e` then kills the script
+      #    at the assignment. A perfectly healthy repo fails with zero output.
+      #    (This cost two red builds and a wrong root-cause before we spotted it.)
       - name: Verify LFS assets are real files
         run: |
-          BAD=$(git lfs ls-files -n | while read -r f; do
-            head -c 45 "$f" 2>/dev/null | grep -q 'git-lfs.github.com/spec' && echo "$f"
-          done)
-          if [ -n "$BAD" ]; then
-            echo "ERROR: unresolved LFS pointers:"; echo "$BAD"; exit 1
+          git lfs ls-files -n > /tmp/lfs-files
+          : > /tmp/lfs-bad
+          while IFS= read -r f; do
+            if head -c 45 "$f" 2>/dev/null | grep -q 'git-lfs.github.com/spec'; then
+              echo "$f" >> /tmp/lfs-bad
+            fi
+          done < /tmp/lfs-files
+          if [ -s /tmp/lfs-bad ]; then
+            echo 'ERROR: unresolved LFS pointers, refusing to build:'
+            cat /tmp/lfs-bad
+            exit 1
           fi
-          echo "All LFS objects resolved"
+          echo "LFS OK ($(wc -l < /tmp/lfs-files) objects materialised)"
 ```
 
 **Set LFS up BEFORE the first push.** `.gitattributes` only affects files
