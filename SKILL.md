@@ -428,8 +428,50 @@ COPY package.json package-lock.json ./
 RUN npm ci --production
 COPY . .
 USER node
+ENV HOST=0.0.0.0
 EXPOSE 3000
 CMD ["node", "server.js"]
+```
+
+**GOTCHA: The app server MUST bind `0.0.0.0`, not `localhost`.** Many Node SSR
+frameworks default to binding `localhost` inside the container, which makes the pod
+unreachable from the k8s Service — the pod shows `Running 1/1` and the logs say
+`Server listening`, but the public URL returns **502** because nothing listens on the
+pod IP. Known offenders:
+
+- **Astro** (`@astrojs/node` standalone): logs `Server listening on http://localhost:4321`
+  — set `ENV HOST=0.0.0.0` in the Dockerfile (or `server: { host: true }` in
+  `astro.config.mjs`)
+- **Nuxt/Nitro**: set `ENV HOST=0.0.0.0` (or `NITRO_HOST=0.0.0.0`)
+- **Next.js standalone**: set `ENV HOSTNAME=0.0.0.0`
+- **`vite preview` / `astro preview`**: never use these as production servers; they
+  bind localhost and are dev tools
+
+Always add `ENV HOST=0.0.0.0` to Node Dockerfiles — it is harmless for frameworks
+that ignore it and fixes the ones that don't. After deploying, verify reachability
+**through the public URL** (not just container logs): a `curl` that succeeds from
+inside the container but a 502 from the ingress means a localhost bind.
+
+#### Node.js SSR (Astro/Nuxt/SvelteKit)
+```dockerfile
+FROM node:22-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+ENV HOST=0.0.0.0
+ENV PORT=4321
+EXPOSE 4321
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wget -qO- http://0.0.0.0:4321/ || exit 1
+CMD ["node", "dist/server/entry.mjs"]
 ```
 
 #### Python (Django/FastAPI/Flask)
@@ -2032,6 +2074,8 @@ Before finalizing, verify:
 - [ ] No real secrets in the manifest (use dict format or empty placeholders -- secrets are managed via UI or Vault)
 - [ ] Memory limits are reasonable for each service
 - [ ] Health check endpoints use `0.0.0.0` not `localhost` (Alpine musl resolves localhost to IPv6 `::1`)
+- [ ] **App server binds `0.0.0.0`, not `localhost`** — Node SSR frameworks (Astro `@astrojs/node`, Nuxt/Nitro, Next standalone) default to localhost; add `ENV HOST=0.0.0.0` to the Dockerfile. A localhost bind looks healthy (`Running 1/1`, "Server listening" in logs) but returns 502 from the public URL
+- [ ] **Public URL verified after deploy** — hit `https://<subdomain>.apps.<platform-domain>` and confirm a non-502 response; container logs alone do NOT prove reachability
 - [ ] Cross-app references (`{{APP:<slug>:<field>}}`) point to apps that exist
 - [ ] `access_level` set in manifest if the app should be public
 - [ ] If the app has API routes, `connectors` section is included in the manifest
