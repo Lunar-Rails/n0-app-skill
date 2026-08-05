@@ -859,6 +859,101 @@ jobs:
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
 - The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
 
+#### Git LFS repos (media-heavy apps) — SILENT FAILURE if unhandled
+
+If the repo tracks binaries with Git LFS (video, audio, image masters, model
+weights, fonts), the default checkout **silently produces broken builds**.
+
+**Why it breaks:** `actions/checkout@v4` without `lfs: true` writes LFS *pointer
+files* — ~130 bytes of text like `version https://git-lfs.github.com/spec/v1` —
+to the paths where the real assets should be. `docker build` copies those text
+files into the image. Nothing errors. The image builds green, pushes green,
+deploys green, and then serves 130-byte text stubs as if they were your video.
+The symptom surfaces as corrupt media in the browser, far from the cause.
+
+**Also: the runners do NOT have `git-lfs` installed.** Setting `lfs: true` alone
+is not enough — install the binary first, or the LFS step fails outright.
+
+```yaml
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      # 1. git-lfs is NOT preinstalled on the runners — install it first.
+      - name: Install git-lfs
+        run: |
+          if ! git lfs version >/dev/null 2>&1; then
+            (apt-get update && apt-get install -y git-lfs) \
+              || (sudo apt-get update && sudo apt-get install -y git-lfs)
+          fi
+          git lfs install --skip-repo
+
+      # 2. lfs: true makes checkout fetch the LFS objects.
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      # 3. Belt and braces. Once git-lfs is installed the smudge filter already
+      #    materialises everything during checkout, so this is normally a ~1s
+      #    no-op -- cheap insurance against a runner image without the filter.
+      - name: Materialise LFS objects
+        run: git lfs pull
+
+      # 4. Fail loudly if anything is still a pointer, rather than shipping
+      #    a green build full of 130-byte text stubs.
+      #
+      #    Guard the test with `if`, NEVER `head | grep -q ... && echo`. Actions
+      #    runs every step under `bash -e -o pipefail`: a CLEAN file makes
+      #    `grep -q` exit 1, that becomes the while-loop's status, which becomes
+      #    the command substitution's status, and `set -e` then kills the script
+      #    at the assignment. A perfectly healthy repo fails with zero output.
+      #    (This cost two red builds and a wrong root-cause before we spotted it.)
+      - name: Verify LFS assets are real files
+        run: |
+          git lfs ls-files -n > /tmp/lfs-files
+          : > /tmp/lfs-bad
+          while IFS= read -r f; do
+            if head -c 45 "$f" 2>/dev/null | grep -q 'git-lfs.github.com/spec'; then
+              echo "$f" >> /tmp/lfs-bad
+            fi
+          done < /tmp/lfs-files
+          if [ -s /tmp/lfs-bad ]; then
+            echo 'ERROR: unresolved LFS pointers, refusing to build:'
+            cat /tmp/lfs-bad
+            exit 1
+          fi
+          echo "LFS OK ($(wc -l < /tmp/lfs-files) objects materialised)"
+```
+
+**Set LFS up BEFORE the first push.** `.gitattributes` only affects files
+committed *after* it exists. Converting an existing repo requires
+`git lfs migrate import`, which **rewrites history and needs a force-push** —
+disruptive for anyone who already cloned. Create `.gitattributes` up front:
+
+```
+*.mp4  filter=lfs diff=lfs merge=lfs -text
+*.mov  filter=lfs diff=lfs merge=lfs -text
+*.wav  filter=lfs diff=lfs merge=lfs -text
+*.mp3  filter=lfs diff=lfs merge=lfs -text
+*.psd  filter=lfs diff=lfs merge=lfs -text
+```
+
+Track only genuinely large binaries. Do NOT blanket-track `*.png`/`*.svg` —
+small UI icons belong in plain git, where they diff and pack efficiently.
+
+**Platform limits and safety notes:**
+- Max single LFS object: **2 GiB** (Gitea `LFS_MAX_FILE_SIZE`). Larger artifacts
+  belong in object storage, not git.
+- LFS auth tokens are short-lived (20m). Long pushes over slow links may need a
+  retry — that is expected, not a misconfiguration.
+- LFS endpoints sit behind the same `*.git/*` route as git push/pull, so they
+  **skip nzero's forward_auth and are gated by Gitea's own credentials**. Use the
+  short-lived Gitea token exactly as for git operations. Never put a credential
+  in `.lfsconfig` — it is a committed file and would leak the secret into history.
+- `gitea-data` uses the `local-path` provisioner, which does **not** enforce the
+  PVC's requested size, so LFS objects land on the shared node disk. Keep repos
+  lean; push intermediate/derived artifacts to object storage instead.
+
 **Required org-level Actions config (auto-provisioned per workspace):**
 
 | Name | Kind | Description |
@@ -2072,6 +2167,7 @@ Before finalizing, verify:
 - [ ] **Workflow includes `docker save | k3s ctr images import` step if the runner has k3s** (containerized runners don't — omit the step and pin the manifest image to the commit-SHA tag instead)
 - [ ] **Workflow uses a hardcoded lowercase `IMAGE` env var** — NEVER use `${{ github.repository }}` in Docker tags (it preserves uppercase and Docker rejects it)
 - [ ] **Workflow branch trigger matches the repo's actual default branch** (not hardcoded `main`)
+- [ ] **If the repo uses Git LFS**: workflow installs `git-lfs` (not preinstalled on runners), uses `actions/checkout@v4` with `lfs: true`, and verifies no pointer files survive — otherwise the build silently bakes 130-byte text stubs in place of the real media
 - [ ] Database services have `volumes` for data persistence
 - [ ] Database services include `POSTGRES_INITDB_ARGS: --data-checksums` for PostgreSQL
 - [ ] `depends_on` ordering is correct (databases -> migration -> app)
