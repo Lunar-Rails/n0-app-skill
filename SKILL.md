@@ -388,8 +388,15 @@ Create a multi-stage Dockerfile optimized for the detected stack.
 CRA bake `import.meta.env.VITE_*` / `NEXT_PUBLIC_*` / `REACT_APP_*` variables into the JS
 bundle at build time. These values come from `.env` files during local dev, but `.env` is
 gitignored and NOT available during Docker builds. You **must** use `ARG` in the Dockerfile
-and `--build-arg` in the CI workflow to pass these values. Store them as Gitea org-level
-Actions secrets (e.g. `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`).
+and `--build-arg` in the CI workflow to pass these values.
+
+**A `--build-arg` is not a secret.** Whatever you pass this way ends up inlined in the JS
+bundle, in plain text, served to every visitor. Only put values here that you would be happy
+to publish: an API base URL, a feature flag, a public map style. Never a database key, a token,
+or anything from `N0_APP_SUPABASE_*` — see
+[Never put the workspace anon key in a browser bundle](#-never-put-the-workspace-anon-key-in-a-browser-bundle).
+Credentials belong in the *runtime* environment of a server-side process, which n0 injects for
+you; they never pass through the build.
 
 ```dockerfile
 FROM node:20-alpine AS build
@@ -397,9 +404,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
+# Public values only — these are inlined into the bundle, not kept secret.
 ARG VITE_API_URL=""
-ARG VITE_SUPABASE_URL=""
-ARG VITE_SUPABASE_ANON_KEY=""
 RUN npm run build
 
 FROM nginx:alpine
@@ -814,9 +820,10 @@ jobs:
       - name: Build and push Docker image
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
+          # Pass only public values as build args — they are inlined into the
+          # JS bundle and served to every visitor. Never a database key.
           docker build \
-            --build-arg VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }} \
-            --build-arg VITE_SUPABASE_ANON_KEY=${{ secrets.VITE_SUPABASE_ANON_KEY }} \
+            --build-arg VITE_API_URL=${{ vars.VITE_API_URL }} \
             -t ${{ env.IMAGE }}:latest \
             -t ${{ env.IMAGE }}:${{ github.sha }} \
             -t ${{ env.IMAGE }}:${SHORT_SHA} .
@@ -1135,6 +1142,13 @@ container:
 | `N0_APP_SUPABASE_ANON_KEY` | Anon key — send as the `apikey` header |
 | `N0_APP_SUPABASE_SCHEMA` | Schema name — send as `Accept-Profile` (reads) / `Content-Profile` (writes) |
 
+**All four are server-side only.** `N0_APP_SUPABASE_ANON_KEY` is just Kong's gateway
+header, not what authorises you — the app reaches its own schema as its own role via
+`N0_APP_SUPABASE_TOKEN`. But that anon key is **workspace-wide**, so shipping it to a
+browser exposes far more than this app. Read all of these from `process.env` at runtime;
+never copy them into a `VITE_*` / `NEXT_PUBLIC_*` variable. See
+[Never put the workspace anon key in a browser bundle](#-never-put-the-workspace-anon-key-in-a-browser-bundle).
+
 Example (server-side, Node — see the real thing in `lunarrails/snake-game`):
 
 ```js
@@ -1213,21 +1227,31 @@ Rules:
 Local dev: the `N0_APP_SUPABASE_*` vars are absent outside the platform — keep
 a simple fallback (JSON file, SQLite) so the app still runs locally.
 
-### Using the Workspace Supabase (simpler alternative)
+### 🚫 Never put the workspace anon key in a browser bundle
 
-If the workspace already has a running Supabase instance (most do), your app can use it
-directly instead of deploying its own. This is only appropriate for **frontend-only
-apps using the anon key**; for app-owned server-side data prefer **App Data** above.
+**The database is never queried directly from the browser — always go through a
+backend.** Use **App Data** above: server-side code reads `N0_APP_SUPABASE_*` from
+the environment at *runtime* and talks to PostgREST as the app's own role.
 
-1. The Supabase API URL follows the pattern: `https://supabase-api-{workspace-slug}.apps.{domain}`
-2. The anon key is available as an org-level Gitea Actions secret: `VITE_SUPABASE_ANON_KEY`
-3. Pass both as Docker build args (see Workflow B template above)
-4. Create a `migration.sql` file and run it against the workspace Supabase Postgres
-5. Your app only needs a single `web` service — no database container needed
+This section used to document the opposite — passing the workspace anon key as
+`VITE_SUPABASE_ANON_KEY` via `--build-arg` for "frontend-only apps". Do not do
+that, and do not reintroduce it:
 
-**IMPORTANT:** Since `.env` files are gitignored and not available during Docker builds,
-you **must** pass Supabase credentials via `ARG` in the Dockerfile and `--build-arg` in
-the CI workflow. Without this, the app will try to connect to `localhost:54321` and fail.
+- `VITE_*` / `NEXT_PUBLIC_*` / `REACT_APP_*` values are **inlined into the JS
+  bundle**. A build arg is not a secret: it ships to every visitor in plain text
+  and is readable with View Source.
+- On n0 the anon key is **workspace-wide**, not per-app. Vanilla Supabase scopes
+  its anon key to one project, which is why "anon key in the browser + RLS" is
+  sound upstream. Here a single key spans *every* app's `app_*` schema and *every*
+  member's private `u_*` schema on that instance, so the upstream reasoning does
+  not carry over — the blast radius is the whole workspace.
+- This has already caused a real incident: data in a private `u_*` schema was
+  published with a grant to `anon`, exposing one member's private data
+  workspace-wide.
+
+If an app must serve data to an unauthenticated browser, expose it through the
+app's own HTTP endpoint. The backend holds the credential; the browser talks to
+the app; the app talks to the database.
 
 ### Supabase-backed app
 Full stack with Supabase (Postgres + Auth + REST API + API Gateway).
@@ -2605,24 +2629,27 @@ curl -s -X POST "$N0_API_BASE/workspaces/$WS_ID/gitea/token/" \
 ```
 Do NOT create Gitea tokens via the web UI or via `gitea admin ... generate-access-token` (SSH). Use an HTTPS git remote, never SSH.
 
-**Supabase credentials** (for apps using the workspace Supabase):
-- **Via API** (recommended):
-  ```bash
-  curl -s "$N0_API_BASE/workspaces/$WS_ID/supabase/credentials/" \
-    -H "Authorization: Bearer $N0_API_TOKEN" | \
-    python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(f'URL: {d[\"url\"]}\nAnon key: {d[\"anon_key\"]}')"
-  ```
-- **URL pattern**: `https://supabase-api-{workspace-slug}.apps.{platform-domain}`
-- These are set as `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in your local `.env` file (gitignored)
+**Supabase credentials for an app: you do not fetch them.** Set `"app_data": true` in
+`n0-app.json` and the platform injects `N0_APP_SUPABASE_*` into every service container at
+deploy time, scoped to the app's own schema. See
+[App Data](#app-data--per-app-isolated-supabase-schema-recommended-for-app-owned-data).
+Read them from the environment server-side; never bake them into a bundle.
 
-**Running Supabase migrations** (for creating tables, RLS policies, etc.):
-```bash
-curl -s -X POST "$N0_API_BASE/workspaces/$WS_ID/supabase/sql/" \
-  -H "Authorization: Bearer $N0_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$(python3 -c "import json; print(json.dumps({'sql': open('migration.sql').read()}))")"
-```
-This executes SQL against the workspace Supabase Postgres in the `public` schema — no SSH or kubectl needed.
+The workspace-wide URL and anon key are still reachable at
+`GET $N0_API_BASE/workspaces/$WS_ID/supabase/credentials/`, but an app should not use them:
+that anon key spans every app's `app_*` schema *and* every member's private `u_*` schema on
+the instance.
+
+**Running Supabase migrations for an app**: put the SQL in `migrations/*.sql` in the app's
+repo (see [App Data](#app-data--per-app-isolated-supabase-schema-recommended-for-app-owned-data)).
+The platform applies them in filename order against the app's own schema on every deploy, so
+the schema is reproducible from git.
+
+Do **not** reach for `POST $N0_API_BASE/workspaces/$WS_ID/supabase/sql/` to set an app's
+tables up. That endpoint is workspace-admin-only, runs as `supabase_admin` (a Postgres
+**superuser**) against the shared `public` schema, and nothing it does is recorded anywhere —
+a fresh deploy comes back without it. It exists for workspace-level administration, not for
+app schema work.
 
 ### API Endpoint Trailing Slash Rules
 
