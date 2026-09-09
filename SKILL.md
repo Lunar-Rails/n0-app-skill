@@ -338,8 +338,8 @@ Use this path when:
       "port": 3000,
       "command": ["node", "/app/server.js"],
       "volumes": {
-        "app": {"mount": "/app"},
-        "data": {"mount": "/data", "persistent": true}
+        "app": "/app",
+        "data": "/data"
       },
       "config_files": {
         "app": {
@@ -354,6 +354,12 @@ Use this path when:
 
 Key points:
 - **No Dockerfile, no Gitea Actions workflow, no registry** — skip Steps 2b and 5 entirely
+- **Volumes are `{name: "/container/path"}` strings.** The platform normalizes a
+  dict straight through and then calls `_strip_mode()` on each value, which
+  expects a string — an object like `{"mount": "/app"}` breaks the deploy. There
+  is no `persistent` flag: a volume named in `config_files` is mounted as a
+  **read-only ConfigMap**, and every other volume becomes a **PVC that survives
+  redeploys**. That is how you get both behaviours in the example above.
 - Store app state in a **persistent volume** (e.g. `/data/db.json`) — the config_files volume is recreated on every deploy
 - Binary assets (images, audio) can be embedded as base64 strings and decoded by the server at startup
 - **Match Node module syntax to the effective `package.json`**: if a `package.json` with `"type": "module"` is present on the volume (or in the working directory), plain `.js` files are ESM — `require()` throws `ReferenceError: require is not defined`. Use `import` syntax, or pin the interpretation explicitly by naming the entry `server.cjs` (CommonJS) / `server.mjs` (ESM). When in doubt, pin with the extension.
@@ -1751,17 +1757,45 @@ This is configured per-app in the N0 admin UI, not in the manifest.
 
 ### Public Path Bypass
 
-Some app endpoints need to be accessible without authentication (webhooks, health checks, API callbacks). Configure these in the N0 admin UI as **public paths**:
+Some app endpoints need to be accessible without authentication (webhooks, health checks, API callbacks). **Any app receiving third-party webhooks needs this** — Twilio, Stripe, GitHub and friends cannot carry an N0 session cookie, so without a public path the provider's POST is swallowed by forward_auth.
+
+`public_paths` is **not a manifest key** — the manifest importer ignores it. Set it
+after deploy over the API (note: **no trailing slash**):
+
+```bash
+curl -s -X PUT "$N0_API_BASE/workspaces/$WS_ID/apps/$APP_ID/public-routes" \
+  -H "Authorization: Bearer $N0_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"paths": ["/webhook/twilio", "/webhook/twilio/*", "/health"]}'
+```
+
+`GET` on the same path returns the current list. It survives redeploys, and is
+also settable in the N0 admin UI.
+
+Matching semantics — **Caddy governs live traffic**, so write patterns for it:
 
 - `/health` — exact match
-- `/api/webhook/*` — prefix match (everything under `/api/webhook/`)
-- `/callback` — exact match
+- `/api/webhook/*` — prefix match (everything **under** `/api/webhook/`)
+- Caddy's `/x/*` does **not** match the bare path `/x`, so list both when the
+  endpoint is hit with and without a trailing segment: `["/x", "/x/*"]`
+- Caddy matching is case-insensitive and allows `*` anywhere; the Django
+  fallback check is case-sensitive and only honours a trailing `*`
 
-These paths bypass both Caddy forward_auth and Django access checks.
+**A public path removes all platform authentication from that route, so the app
+itself must authenticate every publicly-routed endpoint** — verify the provider's
+webhook signature (e.g. Twilio's `X-Twilio-Signature`), and require your own
+bearer token on anything else.
 
 ### API Token Passthrough
 
-Requests to `/api/*` or `/graphql` paths carrying an `Authorization: Bearer *` header bypass forward_auth entirely. This allows external API clients (CI/CD, CLI tools, mobile apps) to authenticate directly with the hosted app using the app's own token system, without needing a N0 session cookie.
+Requests to `/api/*` or `/graphql` carrying an `Authorization: Bearer *` header can bypass forward_auth, letting external clients (CI/CD, CLI tools, mobile apps) authenticate directly with the app's own token system instead of an N0 session cookie.
+
+**This is opt-in per app and OFF for every custom app.** It is gated on the
+`api_bearer_bypass` flag, which is auto-enabled only for an allowlist of built-in
+app types (currently just `affine`) and is read-only over the API — it was
+deliberately narrowed because a blanket bypass exposed one app's unauthenticated
+admin endpoints. Do not design a connector or API client around this bypass: for
+a custom app, add the specific `/api/...` routes to `public_paths` instead and
+enforce your own bearer token inside the app.
 
 ### SSO Checklist
 
@@ -1773,7 +1807,7 @@ When generating a manifest for an app that supports reverse proxy auth:
 - [ ] Enable auto-registration so users are created on first visit
 - [ ] Disable the app's built-in registration page (users come through N0)
 - [ ] Disable the app's built-in login page if possible (users are already authenticated)
-- [ ] Document any public paths that should bypass auth (webhooks, health checks)
+- [ ] Register any public paths that must bypass auth (webhooks, health checks) via `PUT .../public-routes` — not the manifest — and authenticate them inside the app
 
 
 ## App-Published Connectors
