@@ -28,6 +28,41 @@ argument-hint: "[optional: path to repo or description of the app]"
 
 Analyze a codebase and generate everything needed to deploy it as a hosted app on N0.
 
+## Deployment checklist
+
+Use this checklist before the detailed reference below. Apply only the steps relevant
+to the requested app; preserve its existing stack and access level.
+
+1. **Inspect before scaffolding.** Find the existing repository, lockfile, Node
+   `engines`, framework and adapter versions. Reuse an existing repo by cloning it;
+   create an empty workspace-org remote for a new local project.
+2. **Prepare the production runtime.** Audit unused starter dependencies, check
+   framework/adapter compatibility, and align the image's Node major with the app.
+   For Node servers, configure the appropriate bind variable (`HOST` or `HOSTNAME`)
+   for `0.0.0.0`; align the manifest port with the actual listening port.
+3. **Validate the artifact.** For source builds, build and smoke-test the production
+   image when a container runtime is available. Request it through a published
+   container port, not only localhost inside the container. A working sandbox
+   preview does not establish that the production image works. If local image
+   testing is unavailable, use CI and a deployed preview and report that limitation.
+4. **Deploy the intended version.** Wait for CI for the exact source commit; use its
+   immutable image tag. For changes to a running app, follow the preview workflow.
+5. **Verify and finish.** Check the deployment result, upstream reachability, and an
+   authenticated page response containing expected app content. A platform loading
+   page, login page, or HTTP response alone is not functional verification. Report
+   unavailable external feeds separately from deployment status.
+
+Keep the deployment task active through verification using the available job/status
+or follow-up tools. Bound polling to the platform's build/deploy timeout; if it does
+not finish, report the pending job and last observed state rather than claiming
+success or starting another deployment blindly. Do not treat automated follow-ups
+as additional user requests.
+
+Read the stack-specific Dockerfile section for source builds, **Authentication**
+and **Deploying to the Platform (API Flow)** for platform operations, and
+**Preview Deployments** when updating an existing app. The remaining sections are reference material; use
+those relevant to the app rather than introducing unrelated platform features.
+
 ## What This Skill Does
 
 1. **Analyzes** the repository to detect the tech stack, framework, ports, databases, and dependencies
@@ -466,8 +501,8 @@ pod IP. Known offenders:
 
 Always add `ENV HOST=0.0.0.0` to Node Dockerfiles — it is harmless for frameworks
 that ignore it and fixes the ones that don't. After deploying, verify reachability
-**through the public URL** (not just container logs): a `curl` that succeeds from
-inside the container but a 502 from the ingress means a localhost bind.
+**through the app URL using the authentication described below**, not just container
+logs: a `curl` that succeeds from inside the container but a 502 from the ingress means a localhost bind.
 
 #### Node.js SSR (Astro/Nuxt/SvelteKit)
 ```dockerfile
@@ -864,6 +899,36 @@ jobs:
 - **Workflow B should include `docker save | k3s ctr images import` when the runner supports it** — this imports the image directly into k3s containerd, ensuring it's available for pod scheduling even before skopeo mirroring runs. **Not all workspaces have host-mode runners**: on containerized runners the step fails with exit 127 (`k3s: command not found`). Check the runner first, or just rely on commit-SHA image pinning in the manifest (see the Redeploy section) which works everywhere
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
 - The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
+
+#### Buildx / `build-push-action` — SILENT until the push
+
+Use plain `docker build` and `docker push` on `runs-on: self-hosted`, exactly as in
+the workflows above. Do **not** reach for the GitHub-canonical publish pattern:
+
+- ❌ `docker/setup-buildx-action`
+- ❌ `docker/build-push-action`
+- ❌ `cache-from: type=gha` / `cache-to: type=gha`
+
+**Why it breaks:** `REGISTRY` is a loopback address on the runner host (e.g.
+`127.0.0.1:30084`). `setup-buildx-action` creates a **docker-container** builder with
+its own network namespace, so inside it `127.0.0.1` is the builder itself and nothing
+is listening there. The image builds fine and then the push is refused:
+
+```
+ERROR: failed to solve: failed to push 127.0.0.1:30084/ORG/APP:latest:
+failed to do request: Head "http://127.0.0.1:30084/v2/ORG/APP/blobs/sha256:...":
+dial tcp 127.0.0.1:30084: connect: connection refused
+```
+
+**The login step does not catch it.** `docker/login-action` runs on the runner, where
+that address *is* correct, so the log reads `Login Succeeded!` minutes before the
+refused push — the failure looks like a registry permissions problem and is not one.
+
+The `type=gha` cache has the same shape: the runner's cache endpoint is unreachable
+from the builder, so it times out and silently adds minutes to every build.
+
+The symptom downstream is an app stuck in `pulling` / `ImagePullBackOff` with
+`not found`, because the manifest points at a tag CI never pushed.
 
 #### Git LFS repos (media-heavy apps) — SILENT FAILURE if unhandled
 
@@ -2381,10 +2446,9 @@ workflow cannot import into k3s directly:
 3. Re-import the definition (`POST .../apps/definitions/` with the full repo URL)
 4. Redeploy — the changed image reference forces a fresh pull
 
-Verify what's actually deployed by temporarily setting the app public
-(`PUT .../apps/{APP_ID}/access` with `{"access_level": "public"}`), curling a content
-marker from the site, then reverting to `workspace`. Note: access-level changes only
-take effect at the Caddy layer after a redeploy.
+Verify the deployed version using the authenticated request in the deployment
+prerequisites above and an expected content or version marker. Preserve the app's
+access level; making it public is not a verification step.
 
 ### Deploy Versioning & Rollback
 
@@ -2538,8 +2602,13 @@ GITEA_HOST=$(echo "$GITEA"  | python3 -c "import json,sys; print(json.load(sys.s
 curl -s -X POST "https://${GITEA_HOST}/api/v1/orgs/clovrlabs/repos" \
   -H "Authorization: token $GITEA_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name": "my-app", "auto_init": true, "private": false}'
+  -d '{"name": "my-app", "auto_init": false, "private": false}'
 ```
+
+The example creates an empty repo for a new local project. Substitute the
+actual workspace org and app name. If the remote already exists, clone it instead;
+do not initialize a second history or overwrite its README. Repository visibility
+is separate from the hosted app's access level.
 
 ### 2. Develop Locally
 
@@ -2571,10 +2640,16 @@ Use this value in `n0-app.json` image fields. In the workflow YAML, always use `
 
 ```bash
 # HTTPS remote with the Gitea token embedded — NEVER use an SSH remote (git@...)
-git init && git add -A && git commit -m "Initial commit"
+# Run from the new project's root; for an existing repo, work in its clone.
+git init -b main
+git rev-parse --show-toplevel
+git add -A && git commit -m "Initial commit"
 git remote add origin "https://${GITEA_USER}:${GITEA_TOKEN}@${GITEA_HOST}/clovrlabs/my-app.git"
-git push -u origin main --force
+git push -u origin main
 ```
+
+If a push is rejected because the remote has commits, fetch and reconcile that
+history in the correct working directory. Do not force-push to bypass the rejection.
 
 ### 5. Wait for CI Build
 
@@ -2605,6 +2680,13 @@ curl -s -X POST "$N0_API_BASE/workspaces/$WS_ID/apps/" \
 ```
 
 ### 7. Verify
+
+Check the deploy record and warnings as well as app status. Use the iframe-token
+request from the deployment prerequisites for workspace-protected apps, with a
+bounded timeout. Confirm an expected page marker or version and exercise the
+requested feature. Report separately whether the workload started, HTTP answered,
+and the feature worked; include any unavailable external data sources. Opening a
+browser or seeing `running` alone is not sufficient evidence.
 
 ```bash
 # Check app status
