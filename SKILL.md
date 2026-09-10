@@ -900,6 +900,36 @@ jobs:
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
 - The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
 
+#### Buildx / `build-push-action` — SILENT until the push
+
+Use plain `docker build` and `docker push` on `runs-on: self-hosted`, exactly as in
+the workflows above. Do **not** reach for the GitHub-canonical publish pattern:
+
+- ❌ `docker/setup-buildx-action`
+- ❌ `docker/build-push-action`
+- ❌ `cache-from: type=gha` / `cache-to: type=gha`
+
+**Why it breaks:** `REGISTRY` is a loopback address on the runner host (e.g.
+`127.0.0.1:30084`). `setup-buildx-action` creates a **docker-container** builder with
+its own network namespace, so inside it `127.0.0.1` is the builder itself and nothing
+is listening there. The image builds fine and then the push is refused:
+
+```
+ERROR: failed to solve: failed to push 127.0.0.1:30084/ORG/APP:latest:
+failed to do request: Head "http://127.0.0.1:30084/v2/ORG/APP/blobs/sha256:...":
+dial tcp 127.0.0.1:30084: connect: connection refused
+```
+
+**The login step does not catch it.** `docker/login-action` runs on the runner, where
+that address *is* correct, so the log reads `Login Succeeded!` minutes before the
+refused push — the failure looks like a registry permissions problem and is not one.
+
+The `type=gha` cache has the same shape: the runner's cache endpoint is unreachable
+from the builder, so it times out and silently adds minutes to every build.
+
+The symptom downstream is an app stuck in `pulling` / `ImagePullBackOff` with
+`not found`, because the manifest points at a tag CI never pushed.
+
 #### Git LFS repos (media-heavy apps) — SILENT FAILURE if unhandled
 
 If the repo tracks binaries with Git LFS (video, audio, image masters, model
