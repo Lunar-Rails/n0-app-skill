@@ -45,9 +45,15 @@ to the requested app; preserve its existing stack and access level.
    container port, not only localhost inside the container. A working sandbox
    preview does not establish that the production image works. If local image
    testing is unavailable, use CI and a deployed preview and report that limitation.
-4. **Deploy the intended version.** Wait for CI for the exact source commit; use its
+4. **Give the app its secrets — never in code.** A credential must not go in
+   `n0-app.json`, the `Dockerfile`, or the built image: those land in git and in
+   the registry, and a manifest placeholder silently overrides a baked `ENV` at
+   runtime, so the app ends up with no value anyway. Leave the manifest entry
+   empty and set the real value with `workspace_admin_set_app_secrets`, which
+   writes to Vault. See **Secrets Management with Vault**.
+5. **Deploy the intended version.** Wait for CI for the exact source commit; use its
    immutable image tag. For changes to a running app, follow the preview workflow.
-5. **Verify and finish.** Check the deployment result, upstream reachability, and an
+6. **Verify and finish.** Check the deployment result, upstream reachability, and an
    authenticated page response containing expected app content. A platform loading
    page, login page, or HTTP response alone is not functional verification. Report
    unavailable external feeds separately from deployment status.
@@ -1572,6 +1578,12 @@ At deploy time, the AppManager merges environment variables from three sources (
 
 Vault secrets override everything else, so manifests can ship with empty or placeholder values for sensitive fields.
 
+**The image's own `ENV` is not in that list — it loses to all three.** A manifest
+entry of `""` is still an *explicit* env var, and an explicit empty value overrides
+whatever the image baked in. So a secret compiled into the `Dockerfile` does not
+merely leak; it is shadowed at runtime by the placeholder you left in the manifest,
+and the app starts with an empty value while the image looks like it has one.
+
 ### Vault KV Paths
 
 ```
@@ -1636,6 +1648,36 @@ Keys matching `PASSWORD`, `SECRET`, `TOKEN`, or `API_KEY` patterns with empty or
   }
 }
 ```
+
+### Setting Secrets as an Agent
+
+**This is the agent path — the UI and CLI sections below are for humans.**
+
+Use the `workspace_admin_set_app_secrets` tool. It writes to the same Vault paths
+as the UI, merging with any secrets already stored:
+
+```
+workspace_admin_set_app_secrets(
+  app_id="<the hosted app's id>",
+  services={"web": {"LITELLM_API_KEY": "sk-..."}}
+)
+```
+
+- Service names must match the manifest's `services` keys.
+- Empty values are ignored, so you cannot blank an existing secret by passing `""`.
+- **Redeploy afterwards** — Vault values are read at deploy time.
+- Leave the manifest entry as `""`. Do not "fix" it by filling in the real value.
+
+Note the raw `PUT .../apps/{id}/secrets` endpoint documented elsewhere requires the
+acting authority to be a workspace admin, the app's creator, or a listed
+collaborator — a bare agent request is rejected with 403. Use the tool.
+
+**🚫 Never put a secret in the image.** `ENV API_KEY=sk-...` in a `Dockerfile`, a
+value committed to `n0-app.json`, or a key passed as a build arg all end up in git
+history and in every copy of the image in the registry — and are then shadowed at
+runtime anyway (see the merge order above). Reverting the commit does not remove it
+from history: the secret must be rotated. If you have a credential and no way to
+store it, say so and ask, rather than compiling it into an artifact.
 
 ### Managing Secrets via the UI
 
