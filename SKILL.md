@@ -30,6 +30,8 @@ argument-hint: "[optional: path to repo or description of the app]"
 
 Analyze a codebase and generate everything needed to deploy it as a hosted app on N0.
 
+For an icon or cover request on an existing app, go directly to [App Icons and Covers](#app-icons-and-covers). Do not rebuild or redeploy the app for an identity-only change.
+
 ## Deployment checklist
 
 Use this checklist before the detailed reference below. Apply only the steps relevant
