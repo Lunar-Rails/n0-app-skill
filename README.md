@@ -14,6 +14,7 @@ When triggered, this skill:
 4. **Generates** a `.gitea/workflows/build-and-push.yml` CI workflow for building and pushing Docker images
 5. **Validates** the output against N0's manifest schema
 6. **Deploys** via the N0 API (import definition → deploy instance)
+7. **Updates app identity**: upload, replace, or remove app icons and covers through the branding API (requires backend support).
 
 ## Installation
 
@@ -40,6 +41,9 @@ Or copy `SKILL.md` into your project's `.claude/skills/n0-app/` directory.
 - "deploy this on n0"
 - "containerize this"
 - "generate Dockerfile"
+- "upload app icon"
+- "set app cover"
+- "update app branding"
 
 ## What gets generated
 
