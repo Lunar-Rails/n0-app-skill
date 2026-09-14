@@ -3,8 +3,10 @@ name: n0-app
 description: >-
   Analyze a repository and generate a n0-app.json manifest and
   Dockerfile to make it deployable on N0's hosted apps platform.
+  Also manage installed app icons and cover images through the N0 API.
   Trigger on: "make this deployable", "create app manifest", "n0 app",
-  "deploy this on n0", "containerize this", "generate Dockerfile".
+  "deploy this on n0", "containerize this", "generate Dockerfile",
+  "upload app icon", "set app cover", "update app branding".
 effort: high
 user-invocable: true
 argument-hint: "[optional: path to repo or description of the app]"
@@ -2276,6 +2278,64 @@ discovered from the server's `tools/list` and pinned at approval time:
 
 Do **not** define `tools` or `base_url` for MCP connectors — they are rejected.
 
+## App Icons and Covers
+
+Use this workflow when the user asks to add, replace, or remove an app's icon or cover. This changes the **installed app instance**, not its Docker image or manifest. It requires an existing app UUID, app-management permission, and a PAT with `apps:write` (plus `apps:read` to discover and verify the app). Use the selected instance's `N0_API_BASE` and `N0_API_TOKEN` from Authentication; do not switch environments to make an upload succeed.
+
+The manifest's `icon: { letter, bg, color }` remains the catalog fallback. Uploaded images are returned as `icon_url` and `cover_url` on app detail/list responses. Do not put those fields in `n0-app.json`, PATCH them onto the app, or confuse `cover_url` with the runtime `image_name` container reference.
+
+### Choose the app and artwork
+
+- Resolve `WS_ID` and `APP_ID` from the workspace/app APIs. Verify the app name and subdomain; app names can repeat. Use the installed parent app, not a temporary preview, unless the user explicitly wants preview-specific artwork.
+- Prefer user-provided assets or suitable existing repository artwork. Use available image-generation tooling when requested; this skill does not require a particular image tool. Do not replace existing branding merely because you deployed a new version.
+- Upload PNG, JPEG, or WebP files only: at most **5 MiB** and **25 megapixels** each. SVG, GIF, file URLs, and base64 JSON uploads are not accepted.
+- Icons are center-cropped to **256 × 256**; covers to **1600 × 900 (16:9)**. Keep important artwork away from crop edges. The server applies EXIF orientation and re-encodes to WebP. These images appear on app cards; icons also appear in the app header and pinned Studio sidebar. Use public-facing artwork, not screenshots containing credentials or private records.
+
+### Upload or replace
+
+`POST /workspaces/{WS_ID}/apps/{APP_ID}/branding` accepts `multipart/form-data`, with **no trailing slash**. Send `kind=icon` or `kind=cover` and one binary `file`. Each request updates only the selected image; replacing uses the same endpoint. Let curl supply the multipart content type and boundary.
+
+```bash
+# Set ICON_PATH and COVER_PATH to the chosen local files.
+# N0_API_BASE includes /api/v1; WS_ID and APP_ID are UUIDs resolved above.
+curl --fail-with-body --silent --show-error \
+  -X POST "$N0_API_BASE/workspaces/$WS_ID/apps/$APP_ID/branding" \
+  -H "Authorization: Bearer $N0_API_TOKEN" \
+  --form-string 'kind=icon' \
+  --form "file=@${ICON_PATH}"
+
+curl --fail-with-body --silent --show-error \
+  -X POST "$N0_API_BASE/workspaces/$WS_ID/apps/$APP_ID/branding" \
+  -H "Authorization: Bearer $N0_API_TOKEN" \
+  --form-string 'kind=cover' \
+  --form "file=@${COVER_PATH}"
+```
+
+A successful request returns HTTP 200 and the updated app representation. Confirm each request succeeds before reporting both images saved. The two uploads are independent: if the cover fails after the icon succeeds, report the partial result and correct only the failed upload. No build, restart, or redeploy is needed.
+
+### Remove an image
+
+Only remove the image the user requested. Send `kind` and the literal string `remove=true`, without a file. Removing the icon restores the existing fallback; removing the cover removes the card artwork.
+
+```bash
+# To remove the cover instead, change kind=icon to kind=cover.
+curl --fail-with-body --silent --show-error \
+  -X POST "$N0_API_BASE/workspaces/$WS_ID/apps/$APP_ID/branding" \
+  -H "Authorization: Bearer $N0_API_TOKEN" \
+  --form-string 'kind=icon' \
+  --form-string 'remove=true'
+```
+
+### Verify and handle failures
+
+Read `GET /workspaces/{WS_ID}/apps/{APP_ID}/` after the change and check `icon_url`/`cover_url` (inside `data` if the API wraps the response). Verify the selected field is populated after upload or empty after removal, and the other field is unchanged. Resolve relative media URLs against the selected server origin, not the local filesystem. Open the resulting image or inspect the app card to verify the crop.
+
+This feature requires the backend branding endpoint and the `hosted_apps.0032_hostedapp_branding` migration. Older instances may omit the fields or return 404/405. Confirm the workspace/app IDs with the app-detail endpoint; if the app exists but branding is unavailable, report that the server needs the feature deployed. Do not silently fall back to manifest edits, another instance, direct database writes, or infrastructure deployment.
+
+- **400:** correct the kind, file type, size, or image contents before retrying.
+- **401/403:** check the token, `apps:write` scope, workspace membership, and app-management permission; do not loop on the same credentials.
+- **Network/5xx:** read the app back before retrying, because the upload may already have succeeded. Report persistence separately from image delivery if the returned media URL does not load.
+
 ## Icon Color Palette
 
 Common Tailwind color options for the `icon` field:
@@ -2793,6 +2853,8 @@ Notable exceptions:
 | `POST /api/v1/auth/register` | **No** trailing slash |
 | `POST .../apps/definitions/` | **Yes** — trailing slash required |
 | `POST .../apps/` | **Yes** — trailing slash required |
+| `POST .../apps/{APP_ID}/branding` | **No** trailing slash |
+| `GET .../apps/{APP_ID}/` | **Yes** — trailing slash required |
 | `GET .../workspaces/` | **Yes** — trailing slash required |
 | `GET .../supabase/credentials/` | Both work (with or without) |
 | `POST .../supabase/sql/` | Both work (with or without) |
