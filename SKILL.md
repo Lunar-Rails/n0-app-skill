@@ -684,7 +684,7 @@ Apps can reference other running apps in their environment variables using the `
 
 **Use `INTERNAL` for server-to-server calls between apps.** Public app URLs
 (`{{APP:<slug>:URL}}`) sit behind Caddy forward_auth when the target app's
-`access_level` is `workspace`/`private`, so backend HTTP calls to them get a
+`access_level` is `restricted`/`workspace`/`admin`, so backend HTTP calls to them get a
 302 to the login page. The `INTERNAL` address bypasses the auth proxy entirely
 (in-cluster traffic between hosted apps is permitted).
 
@@ -703,21 +703,25 @@ If the referenced app is not running or doesn't exist, the deploy validation wil
 
 #### Access Control in Manifests
 
-You can set the default access level for an app in the manifest:
+**New apps are private by default:** without an `access_level`, only the
+person who deployed the app (plus anyone they invite in Settings → Access &
+sharing) can open it. To share with the whole workspace, or make it public,
+declare it in the manifest:
 
 ```json
 {
-  "name": "My Public App",
+  "name": "My Team App",
   "slug": "my-app",
-  "access_level": "public"
+  "access_level": "workspace"
 }
 ```
 
 | Value | Who can access |
 |-------|---------------|
-| `"workspace"` | Workspace members only (default) |
-| `"restricted"` | Specific allowed users only |
-| `"public"` | Anyone, no auth required |
+| `"restricted"` | The owner and invited users only (**default**) |
+| `"workspace"` | Every signed-in member of the workspace |
+| `"admin"` | Workspace owners and admins only |
+| `"public"` | Anyone with the URL, no sign-in required |
 
 The access level is auto-synced from the manifest on each deploy — no need to manually update the DB.
 
@@ -2411,7 +2415,7 @@ Before finalizing, verify:
 - [ ] **App server binds `0.0.0.0`, not `localhost`** — Node SSR frameworks (Astro `@astrojs/node`, Nuxt/Nitro, Next standalone) default to localhost; add `ENV HOST=0.0.0.0` to the Dockerfile. A localhost bind looks healthy (`Running 1/1`, "Server listening" in logs) but returns 502 from the public URL
 - [ ] **Public URL verified after deploy** — hit `https://<subdomain>.apps.<platform-domain>` and confirm a non-502 response; container logs alone do NOT prove reachability
 - [ ] Cross-app references (`{{APP:<slug>:<field>}}`) point to apps that exist
-- [ ] `access_level` set in manifest if the app should be public
+- [ ] `access_level` set in manifest if anyone besides the owner should open the app (`"workspace"` for the team, `"public"` for no sign-in) — the default is owner-only
 - [ ] If the app has API routes, `connectors` section is included in the manifest
 - [ ] Connector `base_path` starts with `/` and matches the app's actual API prefix
 - [ ] App reads `X-Webauth-*` headers for `platform_identity` connectors
@@ -2484,9 +2488,9 @@ After generating the manifest and pushing code to Gitea, the app must be **impor
 
 **API response envelope:** all N0 API responses are wrapped as `{"success": true, "data": {...}}` — read fields from `data`, not the top level.
 
-**⚠️ NEVER `curl` a deployed app's public URL directly** (e.g. `https://my-app.apps.*.nzero.pro/`) — most apps have `access_level: "workspace"` (the default), which means Caddy's forward_auth will block or redirect the request, causing curl to **hang indefinitely**. This is the #1 cause of stuck agent loops.
+**⚠️ NEVER `curl` a deployed app's public URL directly** (e.g. `https://my-app.apps.*.nzero.pro/`) — most apps are `access_level: "restricted"` (the default — owner only) or `"workspace"`, which means Caddy's forward_auth will block or redirect the request, causing curl to **hang indefinitely**. This is the #1 cause of stuck agent loops.
 
-**Verifying a deployed (workspace-gated) app from the CLI:** use an iframe token to bypass forward_auth:
+**Verifying a deployed (auth-gated) app from the CLI:** use an iframe token to bypass forward_auth:
 ```bash
 TOK=$(curl -s --max-time 10 -H "Authorization: Bearer $N0_API_TOKEN" \
   "$N0_API_BASE/apps/iframe-token" \
@@ -2533,7 +2537,7 @@ curl -s -X POST "$N0_API_BASE/workspaces/${WS_ID}/apps/" \
 
 - `app_type` must match the `slug` in n0-app.json (and the registered AppDefinition)
 - `subdomain` becomes `https://{subdomain}.apps.privateprompt.tech`
-- Optional: `"access_level": "public"` or `"env_overrides": {"KEY": "val"}`
+- Optional: `"access_level"` (`"restricted"` default = owner only; `"workspace"` to share with members; `"public"` for no sign-in) or `"env_overrides": {"KEY": "val"}`
 
 The deploy is async — a background Huey task:
 1. Pulls/mirrors the Docker image into the k3s cluster
