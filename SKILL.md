@@ -1646,10 +1646,9 @@ holds its own values, and you must set them again there.
 > **Legacy paths.** `secret/clovr/apps/{slug}` and
 > `secret/clovr/apps/{slug}/{service}` were instance-global: they resolved by
 > app type alone, ignoring the workspace, so any workspace deploying a given
-> type received that type's credentials. They are still read as a fallback on
-> instances that have not been migrated yet, but the platform can no longer
-> write to them and they are being removed instance by instance. **Never write
-> there.**
+> type received that type's credentials. As of **v3.9.0 they are not read at
+> all** — the values were migrated into each workspace's document and the trees
+> deleted. Anything written there now is simply ignored.
 
 ### Writing Manifests with Vault
 
