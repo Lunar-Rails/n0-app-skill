@@ -1606,7 +1606,8 @@ At deploy time, the AppManager merges environment variables from three sources (
 
 1. **Manifest `env`** -- default/placeholder values from `n0-app.json`
 2. **`env_overrides`** -- per-instance overrides set via the API
-3. **Vault secrets** (highest priority) -- loaded from `secret/clovr/apps/{app-type}` and `secret/clovr/apps/{app-type}/{service-name}`
+3. **Vault secrets** (highest priority) -- loaded from the owning workspace's
+   document, `secret/clovr/workspaces/{workspace-id}/app-secrets/{app-type}`
 
 Vault secrets override everything else, so manifests can ship with empty or placeholder values for sensitive fields.
 
@@ -1618,19 +1619,37 @@ and the app starts with an empty value while the image looks like it has one.
 
 ### Vault KV Paths
 
+Secrets live in **one document per workspace and app type**, holding a
+`services` map:
+
 ```
-secret/clovr/apps/{slug}                  # Shared secrets (all services)
-secret/clovr/apps/{slug}/{service-name}   # Per-service secrets
+secret/clovr/workspaces/{workspace-id}/app-secrets/{app-type}
+  services:
+    "":          # shared by every service of this app
+    {service}:   # per-service, keyed by the manifest's services keys
 ```
 
-**Examples:**
+**Example** -- `crm-pro` in a workspace whose id is `483a2b36-...`:
+
 ```
-secret/clovr/apps/qwen-chat               # OPENAI_API_KEY, WEBUI_SECRET_KEY
-secret/clovr/apps/affine/db               # POSTGRES_PASSWORD
-secret/clovr/apps/crm-pro                 # Shared JWT secret
-secret/clovr/apps/crm-pro/db              # POSTGRES_PASSWORD
-secret/clovr/apps/crm-pro/auth            # GOTRUE_JWT_SECRET, GOTRUE_DB_DATABASE_URL
+secret/clovr/workspaces/483a2b36-.../app-secrets/crm-pro
+  services:
+    "":     JWT_SECRET                 # shared by all services
+    db:     POSTGRES_PASSWORD
+    auth:   GOTRUE_JWT_SECRET, GOTRUE_DB_DATABASE_URL
 ```
+
+**Secrets belong to the workspace that owns the app.** Deploying the same
+`app-type` in another workspace does **not** inherit them -- each workspace
+holds its own values, and you must set them again there.
+
+> **Legacy paths.** `secret/clovr/apps/{slug}` and
+> `secret/clovr/apps/{slug}/{service}` were instance-global: they resolved by
+> app type alone, ignoring the workspace, so any workspace deploying a given
+> type received that type's credentials. They are still read as a fallback on
+> instances that have not been migrated yet, but the platform can no longer
+> write to them and they are being removed instance by instance. **Never write
+> there.**
 
 ### Writing Manifests with Vault
 
@@ -1703,6 +1722,9 @@ workspace_admin_set_app_secrets(
 Note the raw `PUT .../apps/{id}/secrets` endpoint documented elsewhere requires the
 acting authority to be a workspace admin, the app's creator, or a listed
 collaborator — a bare agent request is rejected with 403. Use the tool.
+Replacing a value that is **already set** additionally requires workspace
+admin: a collaborator with edit rights can fill in a secret that is still
+empty, but not overwrite a configured one (403).
 
 **🚫 Never put a secret in the image.** `ENV API_KEY=sk-...` in a `Dockerfile`, a
 value committed to `n0-app.json`, or a key passed as a build arg all end up in git
@@ -1721,64 +1743,69 @@ Users can manage secrets directly from the N0 web interface -- no SSH or Vault C
 4. Click **Auto-generate all missing secrets** to fill in all empty generatable fields at once
 5. Click **Save & Redeploy** -- values are saved to Vault and the app is automatically redeployed
 
-### Storing Secrets via Vault CLI
+### Inspecting Secrets via Vault CLI
 
-For advanced use cases, secrets can also be set via the Vault CLI on the server:
+**Do not write secrets with the CLI.** One document now holds every service for
+the app type, so a hand-written `vault kv put` replaces the whole `services`
+map and silently drops the other services' secrets. Use
+`workspace_admin_set_app_secrets`, `PUT .../apps/{id}/secrets`, or the Secrets
+UI -- all three merge.
+
+To inspect what is set (this prints real values, so server-side only):
 
 ```bash
-# Set VAULT_ADDR and authenticate
 export VAULT_ADDR=http://127.0.0.1:8200
 export VAULT_TOKEN=<root-token>
 
-# Store app-level secrets (shared across all services)
-vault kv put secret/clovr/apps/my-app \
-  API_KEY="real-api-key" \
-  JWT_SECRET="real-jwt-secret"
-
-# Store per-service secrets (e.g., database password)
-vault kv put secret/clovr/apps/my-app/db \
-  POSTGRES_PASSWORD="real-db-password"
-
-# Verify
-vault kv get secret/clovr/apps/my-app
+WS=<workspace-id>   # GET /api/v1/workspaces/ -> id
+vault kv get secret/clovr/workspaces/$WS/app-secrets/my-app
 ```
 
 ### Multi-Container Apps with Shared Secrets
 
-For apps where multiple services need the same secret (e.g., a JWT secret shared between auth and API services), store it at the app level:
+For apps where several services need the same secret (e.g. a JWT secret shared
+between the auth and API services), set it once under the shared `""` service.
+Per-service entries override it for that service:
 
-```bash
-# Shared secret -- available to all services
-vault kv put secret/clovr/apps/my-app \
-  JWT_SECRET="shared-jwt-secret" \
-  DB_PASSWORD="shared-db-password"
-
-# Per-service secrets that include the shared ones in connection strings
-vault kv put secret/clovr/apps/my-app/auth \
-  GOTRUE_DB_DATABASE_URL="postgres://admin:shared-db-password@db:5432/postgres"
-
-vault kv put secret/clovr/apps/my-app/db \
-  POSTGRES_PASSWORD="shared-db-password"
 ```
+workspace_admin_set_app_secrets(
+  app_id="<the hosted app's id>",
+  services={
+    "auth": {"GOTRUE_DB_DATABASE_URL": "postgres://admin:...@db:5432/postgres"},
+    "db":   {"POSTGRES_PASSWORD": "shared-db-password"},
+  },
+)
+```
+
+Resolution order for a given service is: shared `""` first, then that service's
+own entries.
 
 ### Auto-Generation at Deploy Time
 
 At deploy time, secrets matching PASSWORD/SECRET/TOKEN/API_KEY patterns that have empty or placeholder values are automatically generated as 32-character random strings and stored back to Vault. This ensures apps work out of the box without manual secret configuration.
 
-### Cleanup on Uninstall
+### Secrets Are Retained on Uninstall
 
-When an app is uninstalled, its Vault secrets are automatically cleaned up:
-- `secret/clovr/apps/{slug}` (app-level secrets)
-- `secret/clovr/apps/{slug}/{service}` (per-service secrets for each service in the manifest)
+Uninstalling an app does **not** delete its secrets. They belong to the
+workspace and app type rather than to that particular install, so reinstalling
+the same app type picks them up again and a teardown cannot destroy another
+install's credentials.
 
-This prevents orphaned secrets from accumulating in Vault.
+The flip side is that secrets for an app you are finished with linger. Remove
+them deliberately with a root Vault token:
+
+```bash
+vault kv metadata delete secret/clovr/workspaces/$WS/app-secrets/{app-type}
+```
 
 ### Checklist for Secrets
 
 - [ ] No real secrets in `n0-app.json` (use empty strings or dict format with `"secret": true`)
 - [ ] Secret fields use dict format where possible: `{ "secret": true, "generate": true, "label": "..." }`
-- [ ] All sensitive env vars stored in Vault at `secret/clovr/apps/{slug}`
-- [ ] Per-service secrets stored at `secret/clovr/apps/{slug}/{service-name}`
+- [ ] All sensitive env vars stored via the tool, the API, or the Secrets UI --
+      never written straight to the legacy `secret/clovr/apps/...` tree
+- [ ] Secrets shared by every service set under `""`; the rest under their
+      service name
 - [ ] Database passwords are consistent across services that share them
 - [ ] Connection strings in Vault use the correct inter-service hostnames (Docker DNS names like `db`, `redis`)
 
