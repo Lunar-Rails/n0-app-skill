@@ -171,6 +171,8 @@ GITEA_HOST=$(echo "$GITEA_URL" | sed -e 's#^https\?://##' -e 's#/$##')
 The response is `{"success": true, "data": {"token": "...", "username": "...", "gitea_url": "https://gitea-<slug>.apps.<domain>"}}`.
 The Gitea token is scoped to `write:repository,write:package,write:organization`
 and returned once (not stored) — use it for repo creation and git push, then discard.
+It **expires after 24 hours** (`expires_at` in the response) and is revoked as soon
+as the PAT that minted it is revoked; mint a fresh one when a push is rejected.
 
 **RULES (do not violate — SSH and interactive logins break in the sandbox):**
 - ✅ Do all git operations over **HTTPS** with the Gitea token embedded in the remote URL:
@@ -1718,7 +1720,8 @@ workspace_admin_set_app_secrets(
 - **Redeploy afterwards** — Vault values are read at deploy time.
 - Leave the manifest entry as `""`. Do not "fix" it by filling in the real value.
 
-Note the raw `PUT .../apps/{id}/secrets` endpoint documented elsewhere requires the
+Note the raw `PUT .../apps/{id}/secrets` endpoint needs a PAT with the `apps:secrets`
+scope (app-builder keys don't carry it), and it requires the
 acting authority to be a workspace admin, the app's creator, or a listed
 collaborator — a bare agent request is rejected with 403. Use the tool.
 Replacing a value that is **already set** additionally requires workspace
@@ -2333,6 +2336,36 @@ discovered from the server's `tools/list` and pinned at approval time:
 ```
 
 Do **not** define `tools` or `base_url` for MCP connectors — they are rejected.
+
+## Calling Connector Tools from an MCP Client
+
+The platform's MCP server lets an external agent (Claude Code, Cursor, …) call the
+workspace's connector tools directly — custom, app-published **and native**
+connectors such as **RunPod** (GPU pods).
+
+```json
+{
+  "mcpServers": {
+    "n0": {
+      "type": "streamable-http",
+      "url": "$N0_API_BASE/mcp/?workspace=$WS_ID",
+      "headers": {"Authorization": "Bearer $N0_API_TOKEN"}
+    }
+  }
+}
+```
+
+- PAT scopes: `connectors:read` for `tools/list`, `connectors:write` for `tools/call`.
+- Custom/app connector tools are named `<normalized-connector-slug>__<tool>`;
+  native connector tools are `<slug>__<tool>` — e.g. `runpod__list_pods`,
+  `runpod__create_pod`, `runpod__ssh_exec`.
+- Discover which native connectors are exposed (and their tool names and access
+  rule) from `GET $N0_API_BASE/schema/` → `endpoints.mcp_server.native_connectors`.
+- RunPod tools require an active RunPod connection in the workspace and a workspace
+  owner/admin PAT. They spend money on the workspace's RunPod account: list before
+  creating, and confirm with the user before creating, starting, resizing or
+  deleting anything. The chat widgets (`stream_logs`, `open_terminal`) are not
+  available over MCP — use `runpod__ssh_exec` (e.g. `tail -n 200 /workspace/server.log`).
 
 ## App Icons and Covers
 
