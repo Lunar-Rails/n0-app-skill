@@ -159,20 +159,40 @@ Mint a short-lived Gitea access token from the n0 API using the PAT. This is the
 ONLY approved way to get Gitea credentials in the sandbox:
 
 ```bash
-# Requires the PAT to include the gitea:write scope
-GITEA=$(curl -s -X POST "$N0_API_BASE/workspaces/$WS_ID/gitea/token/" \
-  -H "Authorization: Bearer $N0_API_TOKEN")
-GITEA_TOKEN=$(echo "$GITEA" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['token'])")
-GITEA_USER=$(echo "$GITEA"  | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['username'])")
-GITEA_URL=$(echo "$GITEA"   | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['gitea_url'])")
-GITEA_HOST=$(echo "$GITEA_URL" | sed -e 's#^https\?://##' -e 's#/$##')
+# Requires the PAT to include the gitea:write scope.
+# Shell variables do NOT survive between tool calls, so the token is cached in a
+# file and reused. Paste this block before any command that needs Gitea; it only
+# calls the mint endpoint when there is no cached token or it expires within 1h.
+GITEA_CACHE="$HOME/.n0/gitea-token-$WS_ID.json"
+if ! python3 -c "
+import json,sys,datetime as d
+t=json.load(open(sys.argv[1]))
+sys.exit(d.datetime.fromisoformat(t['expires_at'])-d.datetime.now(d.timezone.utc) < d.timedelta(hours=1))
+" "$GITEA_CACHE" 2>/dev/null; then
+  mkdir -p "$HOME/.n0" && chmod 700 "$HOME/.n0"
+  ( umask 077; curl -sf -X POST "$N0_API_BASE/workspaces/$WS_ID/gitea/token/" \
+      -H "Authorization: Bearer $N0_API_TOKEN" \
+      | python3 -c "import json,sys; json.dump(json.load(sys.stdin)['data'], sys.stdout)" \
+      > "$GITEA_CACHE.tmp" ) && mv "$GITEA_CACHE.tmp" "$GITEA_CACHE" \
+    || echo "Gitea token mint failed: check the PAT has the gitea:write scope and WS_ID is set" >&2
+fi
+GITEA_TOKEN=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['token'])" "$GITEA_CACHE")
+GITEA_USER=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['username'])" "$GITEA_CACHE")
+GITEA_URL=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['gitea_url'])" "$GITEA_CACHE")
+GITEA_HOST=$(echo "$GITEA_URL" | sed -E -e 's#^https?://##' -e 's#/$##')
 ```
 
 The response is `{"success": true, "data": {"token": "...", "username": "...", "gitea_url": "https://gitea-<slug>.apps.<domain>"}}`.
 The Gitea token is scoped to `write:repository,write:package,write:organization`
-and returned once (not stored) — use it for repo creation and git push, then discard.
-It **expires after 24 hours** (`expires_at` in the response) and is revoked as soon
-as the PAT that minted it is revoked; mint a fresh one when a push is rejected.
+and is returned once; the server does not store it, so the snippet above caches it
+in `~/.n0/` (mode 600). It **expires after 24 hours** (`expires_at` in the response) and
+is revoked as soon as the PAT that minted it is revoked.
+
+**Mint once, reuse it.** Every call to `gitea/token/` creates a new token, and the
+server revokes all but your 5 newest, so minting per command can revoke a token another
+session is still using. Only when Gitea rejects the token with **401/403**, run
+`rm -f "$HOME/.n0/gitea-token-$WS_ID.json"` and re-run the snippet. Never mint in a
+retry or polling loop. Build failures, 404s and network errors are not token problems.
 
 **RULES (do not violate — SSH and interactive logins break in the sandbox):**
 - ✅ Do all git operations over **HTTPS** with the Gitea token embedded in the remote URL:
@@ -180,6 +200,7 @@ as the PAT that minted it is revoked; mint a fresh one when a push is rejected.
 - ❌ **NEVER** use an SSH git remote (`git@...`, `ssh://...`) — no SSH keys exist in the sandbox.
 - ❌ **NEVER** use email/password `/auth/login` — use the PAT Bearer token instead.
 - ❌ **NEVER** create Gitea tokens via the web UI or via `gitea admin ... generate-access-token` over SSH — use the `gitea/token/` endpoint above.
+- ❌ **NEVER** call `gitea/token/` before every command or inside a loop — reuse the cached token (see above).
 
 ## API Discovery
 
@@ -2781,14 +2802,10 @@ fails in the other.
 
 First mint a Gitea token from the n0 API using your PAT (see "Authentication"
 above — HTTPS-only, sandbox-safe). `GITEA_TOKEN`, `GITEA_USER`, and `GITEA_HOST`
-come from `POST $N0_API_BASE/workspaces/$WS_ID/gitea/token/`:
+come from the cached-token snippet there. Do not mint a new token per command:
 
 ```bash
-GITEA=$(curl -s -X POST "$N0_API_BASE/workspaces/$WS_ID/gitea/token/" \
-  -H "Authorization: Bearer $N0_API_TOKEN")
-GITEA_TOKEN=$(echo "$GITEA" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['token'])")
-GITEA_USER=$(echo "$GITEA"  | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['username'])")
-GITEA_HOST=$(echo "$GITEA"  | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['gitea_url'])" | sed -e 's#^https\?://##' -e 's#/$##')
+# Load (or mint once) the cached Gitea token: run the snippet from "Authentication" first.
 
 curl -s -X POST "https://${GITEA_HOST}/api/v1/orgs/clovrlabs/repos" \
   -H "Authorization: token $GITEA_TOKEN" \
@@ -2904,12 +2921,9 @@ curl -s "$N0_API_BASE/workspaces/" \
 ```
 
 **Gitea token** (for repo creation + git push): mint it from the n0 API with the
-PAT (requires `gitea:write` scope) — HTTPS-only, sandbox-safe:
-```bash
-curl -s -X POST "$N0_API_BASE/workspaces/$WS_ID/gitea/token/" \
-  -H "Authorization: Bearer $N0_API_TOKEN" | \
-  python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(f'token={d[\"token\"]}\nuser={d[\"username\"]}\nurl={d[\"gitea_url\"]}')"
-```
+PAT (requires `gitea:write` scope) — HTTPS-only, sandbox-safe. Use the cached-token
+snippet from "Authentication" (it writes `~/.n0/gitea-token-$WS_ID.json` and reuses it until
+it is about to expire); do not call the endpoint for every command.
 Do NOT create Gitea tokens via the web UI or via `gitea admin ... generate-access-token` (SSH). Use an HTTPS git remote, never SSH.
 
 **Supabase credentials for an app: you do not fetch them.** Set `"app_data": true` in
