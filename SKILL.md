@@ -2974,6 +2974,8 @@ When the owner requests nightly security testing, add a versioned
 `security_testing` recipe to the app's `n0-app.json`. n0 deploys an isolated,
 disposable copy of a pinned green CI build, prepares synthetic data, runs N0mad,
 and retains the report in **App → Settings → Nightly pentesting** for 30 days.
+The staging pilot uses Qwen through LiteLLM; model credentials are managed by
+the platform and must not be added to app recipes or source code.
 The persistent `-dev` candidate and the production instance are not reset.
 Candidate deployment and promotion are separate, explicit operations; legacy
 previews share production secrets and must not be used as scan environments.
