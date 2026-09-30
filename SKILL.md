@@ -2967,3 +2967,61 @@ Notable exceptions:
 
 If you get a `301 Moved Permanently` response, add a trailing slash.
 
+
+## Nightly pentesting with N0mad
+
+When the owner requests nightly security testing, add a versioned
+`security_testing` recipe to the app's `n0-app.json`. n0 deploys an isolated,
+disposable copy of a pinned green CI build, prepares synthetic data, runs N0mad,
+and retains the report in **App → Settings → Nightly pentesting** for 30 days.
+The persistent `-dev` candidate and the production instance are not reset.
+Candidate deployment and promotion are separate, explicit operations; legacy
+previews share production secrets and must not be used as scan environments.
+
+A self-contained static app can declare:
+
+```json
+"security_testing": {
+  "version": 1,
+  "fixture_version": "1",
+  "stateless": true,
+  "ready_path": "/",
+  "authentication": { "type": "none" }
+}
+```
+
+For a stateful app, replace `stateless` with
+`"setup": {"service": "web", "command": ["python", "manage.py", "seed_test_data"], "timeout_seconds": 120}`.
+The command must be repeatable from an empty data directory, with the image's
+`timeout` utility available. Test volumes are ephemeral. Declare *all* service
+environment values under `security_testing.services.<name>.environment`; none
+are inherited from production. `${TEST_PASSWORD}` is replaced with a fresh
+per-run password. Use synthetic accounts, role-separated fixtures, and local
+stubs for dependencies. Do not put credentials in the manifest.
+
+Form authentication uses `{"type":"form", "username":"test-user",
+"login_path":"/login", "success_path":"/dashboard"}`. The seed command must
+create that account using `${TEST_PASSWORD}`. Authentication is exercised by
+N0mad's login flow; a successful readiness HTTP check alone is not proof that
+login works. External services, production SSO, platform tokens, App Data,
+connectors, and config-file mounts are outside the initial runtime's supported
+scope. Do not claim they were tested. Images must be self-contained, commands
+must be argument arrays, and source archives must not contain symlinks.
+
+Validate the recipe against an empty environment, push through the repository's
+normal review/CI workflow, and import the updated app definition. Adding the
+recipe does not enroll the app. For an authorized app, use Settings to enable
+nightly scans or run one immediately. API routes beneath
+`/workspaces/{wid}/apps/{app_id}`:
+
+- `GET /pentests`: configuration/readiness and recent runs.
+- `PATCH /pentests` with `{"enabled":true,"hour_utc":3}`: nightly schedule (UTC).
+- `POST /pentests` with `{}`: queue a run of the latest green default-branch build.
+- `GET /pentests/{run_id}`: status, findings summary, and Markdown report.
+- `POST /pentests/{run_id}` with `{}`: request cancellation.
+
+These endpoints require app management access and the corresponding `apps:read`
+or `apps:write` scope. Failed setup, scanner failures, and timeout are not clean
+security reports. Cleanup must complete before another workspace scan starts.
+Report findings against the recorded source commit, fix the app, and run again;
+this feature does not automatically promote or block promotion.
