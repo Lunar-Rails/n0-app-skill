@@ -54,7 +54,8 @@ to the requested app; preserve its existing stack and access level.
    the registry, and a manifest placeholder silently overrides a baked `ENV` at
    runtime, so the app ends up with no value anyway. Leave the manifest entry
    empty and set the real value with `workspace_admin_set_app_secrets`, which
-   writes to Vault. See **Secrets Management with Vault**.
+   writes to Vault. See **Secrets Management with Vault**. An app that calls an
+   LLM needs no key at all: declare `"llm": true` (see **LLM Access**).
 5. **Deploy the intended version.** Wait for CI for the exact source commit; use its
    immutable image tag. For changes to a running app, follow the preview workflow.
 6. **Verify and finish.** Check the deployment result, upstream reachability, and an
@@ -1611,6 +1612,61 @@ repo administration, connector management, or private messages.
 For scopes outside the allowlist, fall back to the manual pattern above (user-created
 PAT stored as a Vault secret via `PUT .../apps/{id}/secrets`).
 
+## LLM Access (`llm`) — n0's AI gateway
+
+**An app that calls an LLM uses n0's gateway. Do not ask the user for an OpenAI,
+Anthropic or LiteLLM key, and do not copy anyone's personal key into the app.**
+Declare it in the manifest:
+
+```json
+{
+  "name": "My Assistant",
+  "slug": "my-assistant",
+  "llm": true
+}
+```
+
+At deploy the platform gives **the app its own gateway key** and injects into every
+service container:
+
+| Env var | Value |
+|---------|-------|
+| `N0_LLM_BASE_URL` | OpenAI-compatible endpoint, ends in `/v1` |
+| `N0_LLM_API_KEY` | The app's own key |
+
+Use any OpenAI-compatible client, server-side:
+
+```js
+import OpenAI from "openai";
+const llm = new OpenAI({ baseURL: process.env.N0_LLM_BASE_URL, apiKey: process.env.N0_LLM_API_KEY });
+const r = await llm.chat.completions.create({
+  model: process.env.LLM_MODEL || "claude-sonnet",
+  messages: [{ role: "user", content: "Hello" }],
+});
+```
+
+```python
+from openai import OpenAI
+llm = OpenAI(base_url=os.environ["N0_LLM_BASE_URL"], api_key=os.environ["N0_LLM_API_KEY"])
+```
+
+- **Models:** gateway names such as `claude-sonnet`, `claude-haiku`, `claude-opus`,
+  `qwen3.6`. The live list is `GET $N0_LLM_BASE_URL/models` with the key. Put the
+  model name in a plain manifest `env` var (e.g. `"LLM_MODEL": "claude-sonnet"`) so it
+  can change without a rebuild; it is not a secret.
+- **Restrict models** with `"llm": {"models": ["claude-haiku"]}`. The budget is set by
+  the platform operator, not the manifest.
+- **The key is the app's,** not the builder's: usage is tracked per app, it keeps
+  working when people leave, it is reused across redeploys and revoked when the app is
+  deleted or the manifest drops `llm`.
+- **Turning `llm` on or changing it** in a preview/candidate build needs permission to
+  add apps, like `platform_scopes`.
+- Call it **server-side only.** Never send `N0_LLM_API_KEY` to the browser; proxy
+  through the app's own API routes. Never write it into the repo, the image or a Vault
+  secret: it is already in the environment.
+- In local dev, set the two variables yourself (from the user's own key in n0
+  Settings → Connectors → LiteLLM) in an untracked `.env`.
+
 ## Security Notes
 
 - **Never hardcode real secrets** in the manifest. Use empty placeholder values -- real secrets are injected from Vault at deploy time (see "Secrets Management with Vault" below).
@@ -1732,7 +1788,7 @@ as the UI, merging with any secrets already stored:
 ```
 workspace_admin_set_app_secrets(
   app_id="<the hosted app's id>",
-  services={"web": {"LITELLM_API_KEY": "sk-..."}}
+  services={"web": {"STRIPE_SECRET_KEY": "sk_live_..."}}
 )
 ```
 
@@ -2925,6 +2981,11 @@ PAT (requires `gitea:write` scope) — HTTPS-only, sandbox-safe. Use the cached-
 snippet from "Authentication" (it writes `~/.n0/gitea-token-$WS_ID.json` and reuses it until
 it is about to expire); do not call the endpoint for every command.
 Do NOT create Gitea tokens via the web UI or via `gitea admin ... generate-access-token` (SSH). Use an HTTPS git remote, never SSH.
+
+**LLM credentials for an app: you do not fetch them either.** Set `"llm": true` in
+`n0-app.json` and the platform injects `N0_LLM_BASE_URL` / `N0_LLM_API_KEY` at deploy
+time, a key that belongs to the app. See **LLM Access**. An agent cannot read anyone's
+LiteLLM key, by design.
 
 **Supabase credentials for an app: you do not fetch them.** Set `"app_data": true` in
 `n0-app.json` and the platform injects `N0_APP_SUPABASE_*` into every service container at
