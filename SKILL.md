@@ -1640,7 +1640,7 @@ Use any OpenAI-compatible client, server-side:
 import OpenAI from "openai";
 const llm = new OpenAI({ baseURL: process.env.N0_LLM_BASE_URL, apiKey: process.env.N0_LLM_API_KEY });
 const r = await llm.chat.completions.create({
-  model: process.env.LLM_MODEL || "claude-sonnet",
+  model: process.env.LLM_MODEL || "qwen3.8",
   messages: [{ role: "user", content: "Hello" }],
 });
 ```
@@ -1650,11 +1650,14 @@ from openai import OpenAI
 llm = OpenAI(base_url=os.environ["N0_LLM_BASE_URL"], api_key=os.environ["N0_LLM_API_KEY"])
 ```
 
-- **Models:** gateway names such as `claude-sonnet`, `claude-haiku`, `claude-opus`,
-  `qwen3.6`. The live list is `GET $N0_LLM_BASE_URL/models` with the key. Put the
-  model name in a plain manifest `env` var (e.g. `"LLM_MODEL": "claude-sonnet"`) so it
-  can change without a rebuild; it is not a secret.
-- **Restrict models** with `"llm": {"models": ["claude-haiku"]}`. The budget is set by
+- **Models:** use `qwen3.8` (general chat/tool use) or `qwen3.8-thinking` (slower,
+  reasons first); `qwen3.6` is an older alias. **Only use names the gateway lists:**
+  `GET $N0_LLM_BASE_URL/models` with the key returns the live list — check it before
+  hardcoding a model, and never assume OpenAI/Anthropic names (`gpt-4o`,
+  `claude-sonnet`) exist; an unknown name fails with "Invalid model name". Put the
+  model name in a plain manifest `env` var (e.g. `"LLM_MODEL": "qwen3.8"`) so it can
+  change without a rebuild; it is not a secret.
+- **Restrict models** with `"llm": {"models": ["qwen3.8"]}`. The budget is set by
   the platform operator, not the manifest.
 - **The key is the app's,** not the builder's: usage is tracked per app, it keeps
   working when people leave, it is reused across redeploys and revoked when the app is
