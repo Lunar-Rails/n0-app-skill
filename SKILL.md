@@ -102,9 +102,14 @@ This means:
 - The `image` field in `n0-app.json` **MUST** use the full registry path
 - The registry is **this workspace's own Gitea container registry**. Its host is provided
   as the org-level Gitea Actions **variable `REGISTRY`** (auto-provisioned for every
-  workspace — e.g. `gitea-clovrlabs.apps.privateprompt.tech` or `127.0.0.1:30083`).
-  Never hardcode a registry hostname.
-- In **workflow YAML**, reference it as `${{ vars.REGISTRY }}`.
+  workspace — e.g. `gitea-clovrlabs.apps.privateprompt.tech`). It is the workspace
+  Gitea's public host. Workspaces set up before 2026-10 may still show a loopback
+  `127.0.0.1:<port>`; that only works on legacy host-network runners and is replaced
+  by the public host when the workspace moves to isolated runners (see
+  "CI runners are isolated"). Never hardcode a registry hostname.
+- In **workflow YAML**, reference it as `${{ vars.REGISTRY }}`. **Never define a
+  repo-level `REGISTRY` variable** — it overrides the org value, and a stale copy
+  (e.g. a loopback address) breaks every push.
 - In the **`n0-app.json` image field** (which is NOT a workflow and has no `${{ }}`
   substitution), write the **literal value** of the `REGISTRY` variable. Look it up with:
   ```bash
@@ -241,6 +246,8 @@ curl -s -X POST -H "Authorization: Bearer $N0_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"content": "Hello from the API!"}' \
   "$N0_API_BASE/channels/{channel_id}/messages/"
+# Content you (an AI) wrote for the person? Add "ai_generated": true — it is
+# still sent as them, but readers see an "AI-generated" marker. Same for DMs.
 
 # 4. Create a task on a board
 curl -s -X POST -H "Authorization: Bearer $N0_API_TOKEN" \
@@ -674,7 +681,7 @@ that aren't in the upstream compose — this is the #1 cause of deployment failu
 
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
-| `image` | Yes | string | Full Docker image path with tag. For custom images use `<REGISTRY>/{org}/{repo}:{tag}` where `<REGISTRY>` is the literal value of the org-level `REGISTRY` Actions variable (e.g. `127.0.0.1:30083`). For public images use `registry/image:tag` (e.g., `postgres:16-alpine`). For upstream pre-built images use the full registry path (e.g., `ghcr.io/org/app:stable`). |
+| `image` | Yes | string | Full Docker image path with tag. For custom images use `<REGISTRY>/{org}/{repo}:{tag}` where `<REGISTRY>` is the literal value of the org-level `REGISTRY` Actions variable (e.g. `gitea-acme.apps.nzero.pro`). For public images use `registry/image:tag` (e.g., `postgres:16-alpine`). For upstream pre-built images use the full registry path (e.g., `ghcr.io/org/app:stable`). |
 | `port` | Yes | number | Container port the service listens on |
 | `env` | No | object | Environment variables as key-value strings |
 | `volumes` | No | object | Named volume -> container path mapping |
@@ -918,22 +925,13 @@ jobs:
             docker push ${{ env.IMAGE }}:${RELEASE_TAG}
           fi
 
-      # Only include this step if the runner has the k3s binary (host-mode runners).
-      # Containerized runners fail here with exit 127 "k3s: command not found" —
-      # in that case drop this step and pin the manifest image to the commit-SHA
-      # tag instead (see "Redeploy" below).
-      - name: Import into k3s
-        run: |
-          docker save ${{ env.IMAGE }}:latest | k3s ctr images import --all-platforms -
-          echo "Image imported into k3s containerd"
-
       - name: Cleanup
         if: always()
         run: docker rmi ${{ env.IMAGE }}:${{ github.sha }} 2>/dev/null || true
 ```
 
 **Notes (both workflows):**
-- The runner is `self-hosted` and has Docker available (runs on host, not in container)
+- The runner is `self-hosted` and has Docker available — a rootless Docker daemon private to the runner, **not** the server's. Jobs cannot see the server's network, its Docker images, `k3s`/`kubectl`, `localhost:5000`, or any cluster-internal address; do not rely on `--privileged` (at most it is privileged inside the private daemon's user namespace). Reach Gitea and its registry only via `${{ vars.REGISTRY }}` / `${{ github.server_url }}`. Full rules, replacements and a migration checklist: "CI runners are isolated" below
 - **NEVER use `docker/login-action@v3` with `secrets.DOCKER_USERNAME` / `secrets.DOCKER_PASSWORD`** — those secrets do NOT exist in this platform and the step fails with `Error: Username and password required`. The ONLY valid login is the shell step shown in the templates: `echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ vars.REGISTRY }} -u "${{ secrets.REGISTRY_USER }}" --password-stdin`. Do not invent secret names; do not copy GitHub-flavored workflows from upstream repos without converting them
 - **After every push, verify the Actions run actually succeeded before reporting success** — check `GET https://<GITEA_HOST>/api/v1/repos/{org}/{repo}/actions/tasks` (or the repo's Actions tab) and confirm the latest run is green. A hosted app can show status `running` while serving a STALE image from an earlier build; only a green CI run followed by a redeploy updates it
 - **NEVER use `${{ github.repository }}` directly in Docker image tags** — it preserves the original case (e.g., `clovrlabs/UI-TARS-desktop`) and Docker rejects uppercase. Always use a hardcoded lowercase `IMAGE` env var instead
@@ -941,9 +939,132 @@ jobs:
 - Workflow B uses `actions/checkout@v4` for cloning — do NOT use manual `git clone` with hardcoded runner-internal URLs
 - Tags pushed: `latest` (for the manifest), the full commit SHA **and** the 7-char short SHA (for rollback / redeploys — the platform resolves short SHAs to full ones, but pushing both keeps refs unambiguous), plus the git tag name for tagged releases
 - **Prefer human-friendly release tags for deploys**: create a git tag (`git tag v1.2.0 && git push origin v1.2.0`, or descriptive ones like `release-powerups`) and pass that name as `image_tag` when redeploying — it reads better in deploy history than a bare SHA
-- **Workflow B should include `docker save | k3s ctr images import` when the runner supports it** — this imports the image directly into k3s containerd, ensuring it's available for pod scheduling even before skopeo mirroring runs. **Not all workspaces have host-mode runners**: on containerized runners the step fails with exit 127 (`k3s: command not found`). Check the runner first, or just rely on commit-SHA image pinning in the manifest (see the Redeploy section) which works everywhere
+- **Never add a `docker save | k3s ctr images import` step** — runners have no access to the server's containerd (exit 127 `k3s: command not found`). Push a commit-SHA tag and redeploy with `image_tag`, or pin the manifest image to that tag (see the Redeploy section); the platform mirrors it
 - **Always detect the repo's default branch** — do not hardcode `main`. Common alternatives: `master`, `canary`, `develop`
-- The available runner labels are: `self-hosted` (host mode, has Docker), `ubuntu-latest` (containerized via `node:20-bookworm`), `ubuntu-22.04` (containerized). Use `self-hosted` for any workflow that needs Docker
+- The available runner labels are `self-hosted`, `ubuntu-latest` and `ubuntu-22.04` (all `catthehacker/ubuntu` job containers with the runner's private Docker daemon). `services:` containers and ports published with `docker run -p` are reachable on `localhost` from the job
+
+#### CI runners are isolated — what a job can and cannot reach
+
+Gitea Actions runners on n0 are **isolated** (n0 ADR 0045 "Isolated Gitea Actions
+runners"; rolling out server by server since 2026-10). Each runner is a pod with its
+own rootless Docker daemon: no host network, no host Docker socket, no `k3s` or
+`kubectl`, and a NetworkPolicy on egress. Write every workflow for this model —
+legacy host-network runners still exist on some workspaces, but they are going away
+and a workflow that only works there breaks the day its workspace is migrated.
+
+**A job CAN reach:**
+- the internet (Docker Hub, ghcr.io, npm, PyPI, apt, …);
+- this workspace's Gitea through its **public https host** — git over HTTPS
+  (`actions/checkout`, `git push` with a token), the container registry
+  (`${{ vars.REGISTRY }}`) and Actions artifacts. `${{ github.server_url }}`
+  is that host;
+- the n0 API of the **same** n0 instance over https (e.g. the redeploy call below);
+- its own containers: `services:` containers and ports published with
+  `docker run -p` answer on `localhost` inside the job.
+
+**A job CANNOT reach** (blocked on purpose, not flaky):
+- anything on the server's loopback: `127.0.0.1:<port>` / `localhost:<port>` meant
+  for a host service — the Gitea NodePort (e.g. `127.0.0.1:30083`), Postgres
+  `5432`, Redis, Vault, the shared `localhost:5000` registry;
+- cluster-internal addresses: `*.svc.cluster.local`, pod/Service IPs (`10.42.x.x`,
+  `10.43.x.x`), any private (RFC1918) range or cloud-metadata address;
+- the server's containerd or Kubernetes: `k3s ctr`, `kubectl`, `/var/run/docker.sock`;
+- other n0 servers (including another instance's Gitea or n0 API).
+
+| Pattern that now fails | Replace with |
+|---|---|
+| `docker save … \| k3s ctr images import` | Delete the step. Push a commit-SHA tag to `${{ vars.REGISTRY }}` and redeploy with `image_tag` (below) |
+| `docker push localhost:5000/…` (or `127.0.0.1:5000`) | `docker push ${{ vars.REGISTRY }}/<org>/<repo>:<tag>` after the shell `docker login` with `REGISTRY_USER`/`REGISTRY_PASSWORD` |
+| `kubectl set image` / `kubectl rollout restart` | `POST /api/v1/workspaces/{wid}/apps/{app_id}/redeploy` with `{"image_tag": "<sha>"}` |
+| Hardcoded `127.0.0.1:<gitea port>` / `http://localhost:<gitea port>` as registry, clone or API host | `${{ vars.REGISTRY }}` for images, `${{ github.server_url }}` for git/HTTP |
+| Probing a deployed app via its ClusterIP, `*.svc.cluster.local` or a loopback port | The app's public URL (`https://<subdomain>.apps.<domain>`) |
+| Tests against the server's Postgres/Redis | A `services:` container (below) or `docker run -p` inside the job |
+| `-v /var/run/docker.sock:…`, `--privileged` | The job already has a Docker CLI wired to its private daemon; don't mount sockets or rely on privileged mode |
+| A **repo-level** `REGISTRY` variable | Delete it — it overrides the org-level value n0 manages |
+
+**Deploy from CI** — build, push a commit-SHA tag, then ask n0 to redeploy with that
+tag. Store a PAT with `apps:write` as a secret (repo or org) and the API base,
+workspace id and app id as variables; never paste the PAT into the workflow:
+
+```yaml
+      - name: Login to Gitea Registry
+        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ vars.REGISTRY }} -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Build and push
+        run: |
+          docker build -t ${{ env.IMAGE }}:${{ github.sha }} .
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Redeploy on n0
+        run: |
+          curl -fsS -X POST "${{ vars.N0_API_BASE }}/workspaces/${{ vars.N0_WS_ID }}/apps/${{ vars.N0_APP_ID }}/redeploy" \
+            -H "Authorization: Bearer ${{ secrets.N0_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"image_tag\": \"${{ github.sha }}\"}"
+```
+
+`image_tag` replaces the tag of the manifest's **entrypoint** image (and of other
+services built from the same image repository) for this deploy; the platform resolves it in the
+workspace registry (a short SHA prefix also works) and mirrors it into the cluster. A
+later redeploy **without** `image_tag` goes back to the tag written in `n0-app.json`,
+so for a lasting change pin the SHA in the manifest too (see "Redeploy"). For a running
+production app, consider `POST …/apps/{app_id}/previews` with the same `image_tag`
+instead and promote after checking (see "Preview Deployments").
+
+The image reference in `n0-app.json` keeps working whether it uses the public host
+or an old `127.0.0.1:<gitea port>` — both name the same registry. Prefer the public
+host (the current `REGISTRY` value) in new manifests.
+
+**Test databases and other dependencies — use `services:`:**
+
+```yaml
+jobs:
+  test:
+    runs-on: self-hosted
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - run: DATABASE_URL=postgres://postgres:test@localhost:5432/postgres npm test
+```
+
+Services (and `docker run -d -p 6379:6379 redis:7-alpine` inside a step) are reachable
+on `localhost`. Concurrent jobs on one runner share that network namespace, so two jobs
+publishing the same port can clash — pick distinct host ports when that matters, and
+wait for readiness (`pg_isready`, a retry loop) before running tests.
+
+**Calling the Gitea API from a workflow — avoid it if you can.** Clone, push, tags and
+releases-by-tag work over git HTTPS; images go through the registry; deploys go through
+the n0 API. `/api/v1/*` on the public Gitea host sits behind n0's sign-in (forward_auth)
+and is **not** opened for tokens by default, so a call such as
+`curl -H "Authorization: token …" https://<gitea-host>/api/v1/…` usually gets a
+`302` to the n0 login page instead of JSON. Whether it passes depends on how the
+workspace's Gitea app is exposed: a workspace admin can list `/api/v1/*` in the Gitea
+app's public routes (`PUT /api/v1/workspaces/{wid}/apps/{gitea_app_id}/public-routes`,
+`{"paths": ["/api/v1/*"]}`) — Gitea then authenticates those calls itself with the token
+— and the token-passthrough flag (`api_bearer_bypass`) can only be set by a platform
+operator. Check before relying on it: a request with a bogus token should answer
+`401` JSON from Gitea, not a redirect. Never "fix" it by switching back to a loopback
+address — that is unreachable from CI. Keep any token in a secret.
+
+**Migrating an existing workflow — checklist:**
+- [ ] `grep -nE '127\.0\.0\.1|localhost:|k3s|kubectl|docker\.sock|svc\.cluster\.local|privileged|/api/v1' .gitea/workflows/* .github/workflows/*`
+      and fix every hit using the table above (loopback references to the job's
+      *own* `services:`/`docker run -p` ports are fine)
+- [ ] Registry host is `${{ vars.REGISTRY }}` everywhere; login is the shell
+      `docker login` with `REGISTRY_USER`/`REGISTRY_PASSWORD`
+- [ ] No repo-level `REGISTRY` variable (repo Settings → Actions → Variables)
+- [ ] No `k3s ctr`, `kubectl`, `localhost:5000` or docker-socket steps; deploy via the
+      n0 redeploy API with `image_tag`
+- [ ] Tests start their own databases with `services:` / `docker run -p`
+- [ ] Gitea API calls removed, or verified to reach Gitea (see above)
+- [ ] Workflows on **every** branch you build fixed, not only the default branch;
+      re-run the workflow and confirm it is green before reporting success
 
 #### Buildx / `build-push-action` — SILENT until the push
 
@@ -954,10 +1075,15 @@ the workflows above. Do **not** reach for the GitHub-canonical publish pattern:
 - ❌ `docker/build-push-action`
 - ❌ `cache-from: type=gha` / `cache-to: type=gha`
 
-**Why it breaks:** `REGISTRY` is a loopback address on the runner host (e.g.
-`127.0.0.1:30084`). `setup-buildx-action` creates a **docker-container** builder with
-its own network namespace, so inside it `127.0.0.1` is the builder itself and nothing
-is listening there. The image builds fine and then the push is refused:
+**Why:** `setup-buildx-action` creates a **docker-container** builder — a separate
+BuildKit container with its own network namespace, which by default asks for
+`--privileged`. The runner's rootless daemon refuses or limits privileged containers,
+and anything that only resolves on the runner side does not resolve inside the
+builder. With the public `REGISTRY` host the push itself is no longer the classic
+failure, but this setup is not verified on n0 runners, and plain `docker build`
+(BuildKit built into the daemon) is. Legacy workspaces whose `REGISTRY` is still a
+loopback address (e.g. `127.0.0.1:30084`) fail at the push, because inside the builder
+`127.0.0.1` is the builder itself:
 
 ```
 ERROR: failed to solve: failed to push 127.0.0.1:30084/ORG/APP:latest:
@@ -965,11 +1091,11 @@ failed to do request: Head "http://127.0.0.1:30084/v2/ORG/APP/blobs/sha256:...":
 dial tcp 127.0.0.1:30084: connect: connection refused
 ```
 
-**The login step does not catch it.** `docker/login-action` runs on the runner, where
-that address *is* correct, so the log reads `Login Succeeded!` minutes before the
-refused push — the failure looks like a registry permissions problem and is not one.
+**The login step does not catch it.** `docker/login-action` runs on the runner, not in
+the builder, so the log reads `Login Succeeded!` minutes before the failed push — the
+failure looks like a registry permissions problem and is not one.
 
-The `type=gha` cache has the same shape: the runner's cache endpoint is unreachable
+The `type=gha` cache has the same shape: the runner's cache endpoint is not reachable
 from the builder, so it times out and silently adds minutes to every build.
 
 The symptom downstream is an app stuck in `pulling` / `ImagePullBackOff` with
@@ -1074,7 +1200,7 @@ small UI icons belong in plain git, where they diff and pack efficiently.
 
 | Name | Kind | Description |
 |------|------|-------------|
-| `REGISTRY` | variable | Host of this workspace's Gitea container registry (e.g. `127.0.0.1:30083`). Use as `${{ vars.REGISTRY }}` in YAML; paste its literal value into `n0-app.json` image fields |
+| `REGISTRY` | variable | Host of this workspace's Gitea container registry — its public host (e.g. `gitea-acme.apps.nzero.pro`; workspaces not yet on isolated runners may still show `127.0.0.1:30083`). Use as `${{ vars.REGISTRY }}` in YAML; paste its literal value into `n0-app.json` image fields. Never shadow it with a repo-level variable |
 | `REGISTRY_USER` | secret | Username for the Gitea container registry |
 | `REGISTRY_PASSWORD` | secret | Password/token (write:package scope) for the Gitea container registry |
 
@@ -1083,6 +1209,8 @@ inherit them. If they are ever missing, they can be (re)created from **Org Setti
 Actions → Variables / Secrets**, or by re-running the backend `backfill_workspace_gitea_tokens`
 provisioning. Confirm the current value of `REGISTRY` with
 `GET /api/v1/orgs/{org}/actions/variables/REGISTRY` before writing image paths.
+A repo-level variable or secret with the same name **overrides** the org value — do
+not create one; delete any you find.
 
 ## Common App Patterns
 
@@ -1611,6 +1739,33 @@ repo administration, connector management, or private messages.
 
 For scopes outside the allowlist, fall back to the manual pattern above (user-created
 PAT stored as a Vault secret via `PUT .../apps/{id}/secrets`).
+
+## Acting as the Signed-in Person ("Sign in with n0")
+
+`platform_scopes` act as the **app's own** service account. When the app must act
+**as the person using it** — "send Giacomo a DM from me", "create this task as me" —
+use delegated **Sign in with n0** instead (standard OAuth 2 authorization code + PKCE):
+
+1. A workspace admin registers the app under **Workspace settings → OAuth apps** with
+   the redirect URI (e.g. `https://<subdomain>.<apps domain>/auth/callback`) and the
+   scopes it needs. Store the client ID/secret as app secrets (never in the repo).
+2. Send the person to `{issuer}/api/v1/oauth/authorize` (discovery:
+   `{issuer}/.well-known/openid-configuration`). n0 shows a consent screen that says
+   the app will **act as them**; they approve or deny.
+3. Exchange the code at `/api/v1/oauth/token`; keep the access + refresh token
+   **per person, server-side only**. Call the n0 API with `Authorization: Bearer <token>`.
+
+**Delegated scopes (allowlist):** `members:read`, `channels:read`, `channels:write`,
+`dms:write`, `boards:read`, `boards:write`. `dms:write` can start a DM and send to it but
+never read DMs. Tokens work **only in the workspace the OAuth app is registered in**,
+only on API endpoints that declare one of the granted scopes (anything else → 403), and
+only while the person is a non-guest member. Removing a scope from the app takes effect
+on live tokens immediately. Access tokens last 1 hour; refresh rotates them.
+
+Useful calls: `GET /workspaces/{wid}/members` · `POST /workspaces/{wid}/dms/`
+`{"user_ids": [...]}` → `POST /dms/{id}/messages` `{"content": "...", "ai_generated": true}` ·
+`POST /channels/{cid}/messages` · boards under `/workspaces/{wid}/boards/...`.
+Always confirm with the person before sending or changing anything on their behalf.
 
 ## LLM Access (`llm`) — n0's AI gateway
 
@@ -2530,11 +2685,12 @@ Before finalizing, verify:
 - [ ] All required fields present (`name`, `slug`, `description`, `services`)
 - [ ] Entrypoint service exists and has correct `port`
 - [ ] All services have `image` with specific tag
-- [ ] **Custom images use the workspace registry path** (`<REGISTRY>/{org}/{repo}:tag`, where `<REGISTRY>` is the literal value of the `REGISTRY` org variable, e.g. `127.0.0.1:30083`) — NEVER bare names like `my-app:latest`
+- [ ] **Custom images use the workspace registry path** (`<REGISTRY>/{org}/{repo}:tag`, where `<REGISTRY>` is the literal value of the `REGISTRY` org variable, e.g. `gitea-acme.apps.nzero.pro`) — NEVER bare names like `my-app:latest`
 - [ ] **Upstream images use the full registry path** (e.g., `ghcr.io/org/app:stable`) — NOT just the image name
 - [ ] `.gitignore` excludes `node_modules/`, `.env`, `dist/`, etc.
 - [ ] `.gitea/workflows/build-and-push.yml` exists (build from source OR mirror upstream)
-- [ ] **Workflow includes `docker save | k3s ctr images import` step if the runner has k3s** (containerized runners don't — omit the step and pin the manifest image to the commit-SHA tag instead)
+- [ ] **Workflow has no `k3s ctr` / `kubectl` / `localhost:5000` / docker-socket steps and no `127.0.0.1:<port>` / `*.svc.cluster.local` host references** (isolated runners cannot reach the server) — push a commit-SHA tag and redeploy with `image_tag` (see "CI runners are isolated")
+- [ ] **No repo-level `REGISTRY` variable**; test databases run as `services:` containers
 - [ ] **Workflow uses a hardcoded lowercase `IMAGE` env var** — NEVER use `${{ github.repository }}` in Docker tags (it preserves uppercase and Docker rejects it)
 - [ ] **Workflow branch trigger matches the repo's actual default branch** (not hardcoded `main`)
 - [ ] **If the repo uses Git LFS**: workflow installs `git-lfs` (not preinstalled on runners), uses `actions/checkout@v4` with `lfs: true`, and verifies no pointer files survive — otherwise the build silently bakes 130-byte text stubs in place of the real media
@@ -2629,12 +2785,14 @@ After generating the manifest and pushing code to Gitea, the app must be **impor
 
 **⚠️ NEVER `curl` a deployed app's public URL directly** (e.g. `https://my-app.apps.*.nzero.pro/`) — most apps are `access_level: "restricted"` (the default — owner only) or `"workspace"`, which means Caddy's forward_auth will block or redirect the request, causing curl to **hang indefinitely**. This is the #1 cause of stuck agent loops.
 
-**Verifying a deployed (auth-gated) app from the CLI:** use an iframe token to bypass forward_auth:
+**Verifying a deployed (auth-gated) app from the CLI:** use an entry token to pass forward_auth.
+Tokens are bound to one app (`?host=`), single-use and expire after ~2 minutes; forward_auth
+answers with a cookie + redirect to the clean URL, so keep cookies and follow redirects:
 ```bash
 TOK=$(curl -s --max-time 10 -H "Authorization: Bearer $N0_API_TOKEN" \
-  "$N0_API_BASE/apps/iframe-token" \
+  "$N0_API_BASE/apps/iframe-token?host=my-app.apps.DOMAIN" \
   | python3 -c "import json,sys;print(json.load(sys.stdin)['data']['token'])")
-curl -s --max-time 10 "https://my-app.apps.DOMAIN/?_ppauth=$TOK&_cb=$(date +%s)"
+curl -sL -c /tmp/app.jar -b /tmp/app.jar --max-time 10 "https://my-app.apps.DOMAIN/?_ppauth=$TOK&_cb=$(date +%s)"
 ```
 Add `--max-time 10` to ALL curl commands to prevent hangs. Add a cache-buster query param (`_cb`) when verifying fresh deploys.
 
@@ -2708,12 +2866,22 @@ curl -s -X POST "$N0_API_BASE/workspaces/${WS_ID}/apps/${APP_ID}/redeploy" \
 **WARNING — redeploy does NOT pick up a new `:latest` build by itself.** k3s containerd
 caches the image by tag: if the pod's image reference is unchanged (`...:latest`), the
 node reuses the cached image and the app keeps serving the old build. A `{"tag": "..."}`
-body on the redeploy call is accepted but ignored. Reliable update flow when the CI
-workflow cannot import into k3s directly:
+body on the redeploy call is accepted but ignored (the field is `image_tag`). CI can
+never import into k3s directly — runners have no access to the server.
+
+**Quick path (custom-built images):** redeploy with the CI-built tag —
+`-d '{"image_tag": "<full-or-short-commit-sha>"}'`. The entrypoint image (and services
+built from the same image repository) run that tag; the platform resolves it in the
+workspace registry and mirrors it. CI can make this call itself as its last step (see
+"CI runners are isolated"). It is not stored in the manifest: a later redeploy
+without `image_tag` returns to the manifest's tag.
+
+**Lasting update flow:**
 
 1. Push code → CI builds and pushes both `:latest` and `:{commit-sha}` tags
-2. Pin the image in `n0-app.json` to the full commit-SHA tag
-   (`localhost:5000/org/repo:<sha>`) and push
+2. Pin the image in `n0-app.json` to the full commit-SHA tag in the workspace
+   Gitea registry (`<REGISTRY>/org/repo:<sha>`, where `<REGISTRY>` is the literal value
+   of the `REGISTRY` org variable, e.g. `gitea-acme.apps.nzero.pro`) and push
 3. Re-import the definition (`POST .../apps/definitions/` with the full repo URL)
 4. Redeploy — the changed image reference forces a fresh pull
 
@@ -2796,13 +2964,13 @@ The K8sAppManager handles image sources automatically:
 
 | Image Pattern | Behavior |
 |--------------|----------|
-| `127.0.0.1:{port}/{org}/{repo}:{tag}` | Workspace Gitea registry (loopback) — mirrored into in-cluster registry via skopeo Job |
-| `gitea-{slug}.apps.{domain}/{org}/{repo}:{tag}` | Workspace Gitea registry (external hostname) — also mirrored via skopeo |
+| `127.0.0.1:{port}/{org}/{repo}:{tag}` | Workspace Gitea registry (loopback name, older manifests) — mirrored into in-cluster registry via skopeo Job. Fine in a manifest; never push to it from CI |
+| `gitea-{slug}.apps.{domain}/{org}/{repo}:{tag}` | Workspace Gitea registry (public host = the `REGISTRY` value; preferred) — also mirrored via skopeo |
 | `postgres:16-alpine`, `redis:7-alpine` | Public Docker Hub — pulled directly by containerd |
 | `ghcr.io/org/app:stable` | External registry — pulled directly by containerd |
-| `localhost:5000/{path}` | Already in in-cluster registry — used as-is |
+| `localhost:5000/ws-<workspace-id-hex>/{path}` | This workspace's namespace in the in-cluster registry — used as-is. Any other `localhost:5000/...` path (another workspace's images, platform images) is rejected; legacy `localhost:5000/<own-org>/...` refs are re-mirrored from the workspace Gitea |
 
-Both the loopback address (`127.0.0.1:{port}`) and external hostname (`gitea-{slug}.apps.{domain}`) formats are recognized as workspace Gitea registries and mirrored automatically. The CI workflow also imports images directly into k3s containerd via `docker save | k3s ctr images import` as a belt-and-suspenders approach.
+Mirrored images are stored under the workspace's own prefix (`localhost:5000/ws-<workspace-id-hex>/{org}/{repo}:{tag}`), so they can never collide with another workspace's images. A loopback image must use the workspace's **own** Gitea port; other `127.0.0.1:<port>` hosts are rejected. Both the loopback address (`127.0.0.1:{port}`) and external hostname (`gitea-{slug}.apps.{domain}`) formats are recognized as workspace Gitea registries and mirrored automatically — this mirroring is done by the platform at deploy time, server-side. CI never writes to `localhost:5000` itself: it pushes to `${{ vars.REGISTRY }}` and lets the deploy mirror the image.
 
 ### Common Deployment Errors
 
@@ -2815,6 +2983,8 @@ Both the loopback address (`127.0.0.1:{port}`) and external hostname (`gitea-{sl
 | Build push failure | Stale or missing registry credentials | Re-provision org-level Actions secrets (see below) |
 | `No n0-app.json found` on import despite manifest in repo root | Short-form `org/repo` repo_url not resolved on this deployment | Use the full Gitea URL as `repo_url` |
 | App serves old version after redeploy | k3s containerd cached the unchanged `:latest` tag | Pin the manifest image to the commit-SHA tag, re-import definition, redeploy |
+| CI: `k3s: command not found`, `connection refused` on `127.0.0.1:<port>` / `localhost:5000`, timeouts to `*.svc.cluster.local` or `10.4x.x.x` | The workspace runs isolated CI runners; the step relied on the server | Follow "CI runners are isolated": push to `${{ vars.REGISTRY }}`, redeploy via the n0 API, run dependencies as `services:` |
+| CI: Gitea `/api/v1` call returns HTML / a `302` to the n0 login page | `/api/v1` on the public Gitea host is behind n0 sign-in | Avoid the Gitea API in CI, or have a workspace admin open `/api/v1/*` as a public route of the Gitea app (see "CI runners are isolated") |
 | Actions run stuck "in_progress" then marked "failure", but image was pushed | Runner's final status report to Gitea timed out — bookkeeping only | Trust the job log (`/actions/runs/{run}/jobs` → `/actions/jobs/{id}/logs`): if it ends with "Job succeeded" and shows push digests, the build is fine |
 
 ### Troubleshooting Registry Credentials
@@ -2835,13 +3005,18 @@ kubectl -n n0-clovrlabs exec deployment/gitea -- \
   --token-name registry-push-$(date +%s) \
   --scopes write:package,read:package --raw
 
-# 2. Update org secrets via Gitea API
+# 2. Update org secrets via Gitea API — run ON THE SERVER: <gitea-port> is the
+#    workspace Gitea's loopback NodePort, which only the server itself can reach
+#    (never CI jobs or sandboxes)
 ADMIN_TOKEN="<gitea-admin-token>"
 curl -X PUT -H "Authorization: token $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  "http://127.0.0.1:32102/api/v1/orgs/clovrlabs/actions/secrets/REGISTRY_PASSWORD" \
+  "http://127.0.0.1:<gitea-port>/api/v1/orgs/clovrlabs/actions/secrets/REGISTRY_PASSWORD" \
   -d '{"data": "<new-token>"}'
 ```
+
+`REGISTRY_USER` must be the owner of the token stored in `REGISTRY_PASSWORD`; if the
+two drift apart (e.g. someone set one of them by hand), `docker login` fails.
 
 ## Complete Local Dev → Deploy Workflow
 

@@ -52,7 +52,7 @@ Or copy `SKILL.md` into your project's `.claude/skills/n0-app/` directory.
 | `n0-app.json` | App manifest (services, ports, env vars, volumes) |
 | `Dockerfile` | Multi-stage Docker build (if no upstream image exists) |
 | `.dockerignore` | Excludes unnecessary files from the build |
-| `.gitea/workflows/build-and-push.yml` | CI pipeline: build → push → import into k3s |
+| `.gitea/workflows/build-and-push.yml` | CI pipeline: build → push to the workspace registry (optionally → n0 redeploy). Runs on isolated runners: no `k3s`/`kubectl`, no server loopback |
 | `migration.sql` | Database migration (if the app needs a DB table) |
 
 ## N0 Platform Overview
