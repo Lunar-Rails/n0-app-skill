@@ -723,6 +723,12 @@ Apps can reference other running apps in their environment variables using the `
 302 to the login page. The `INTERNAL` address bypasses the auth proxy entirely
 (in-cluster traffic between hosted apps is permitted).
 
+Because `INTERNAL` skips the auth proxy, anything in the cluster that can reach a
+container port can send it requests with **forged plain `X-Webauth-*` headers**. Never
+treat those headers as proof of identity on a port reachable in-cluster; the signed
+`X-N0-Assertion` JWT (see "Verifying identity: X-N0-Assertion") cannot be forged, and
+requests that did not pass through the proxy simply do not carry a valid one.
+
 **Example usage in a manifest:**
 ```json
 {
@@ -1711,7 +1717,7 @@ into **every service container** as environment variables:
 | Env var | Value |
 |---------|-------|
 | `N0_PLATFORM_TOKEN` | The raw PAT (`clovr_pat_...`) — always set/overwritten by the platform |
-| `N0_API_BASE` | Platform API base, e.g. `https://app.moon.nzero.pro/api/v1` (default only — manifest `env` wins if set) |
+| `N0_API_BASE` | Platform API base, e.g. `https://moon.nzero.pro/api/v1` (default only — manifest `env` wins if set) |
 | `N0_WORKSPACE_ID` | UUID of the workspace the app is installed in (default only) |
 
 Example server-side usage (geocoding without any manual token setup):
@@ -1751,7 +1757,9 @@ PAT stored as a Vault secret via `PUT .../apps/{id}/secrets`).
 
 `platform_scopes` act as the **app's own** service account. When the app must act
 **as the person using it** — "send Giacomo a DM from me", "create this task as me" —
-use delegated **Sign in with n0** instead (standard OAuth 2 authorization code + PKCE):
+use delegated **Sign in with n0** instead (standard OAuth 2 authorization code + PKCE).
+Only use it when the app calls the n0 API as the user; for identity-only login verify the
+`X-N0-Assertion` JWT instead (see "Verifying identity: X-N0-Assertion").
 
 1. A workspace admin registers the app under **Workspace settings → OAuth apps** with
    the redirect URI (e.g. `https://<subdomain>.<apps domain>/auth/callback`) and the
@@ -1795,6 +1803,7 @@ service container:
 |---------|-------|
 | `N0_LLM_BASE_URL` | OpenAI-compatible endpoint, ends in `/v1` |
 | `N0_LLM_API_KEY` | The app's own key |
+| `N0_LLM_MODEL` | The model to use by default: the server's default model (Claude Haiku 4.5, `claude-haiku`, unless the operator changed it) if your `models` policy allows it, else your first allowed model |
 
 Use any OpenAI-compatible client, server-side:
 
@@ -1802,7 +1811,7 @@ Use any OpenAI-compatible client, server-side:
 import OpenAI from "openai";
 const llm = new OpenAI({ baseURL: process.env.N0_LLM_BASE_URL, apiKey: process.env.N0_LLM_API_KEY });
 const r = await llm.chat.completions.create({
-  model: process.env.LLM_MODEL || "qwen3.8",
+  model: process.env.LLM_MODEL || process.env.N0_LLM_MODEL,
   messages: [{ role: "user", content: "Hello" }],
 });
 ```
@@ -1812,8 +1821,9 @@ from openai import OpenAI
 llm = OpenAI(base_url=os.environ["N0_LLM_BASE_URL"], api_key=os.environ["N0_LLM_API_KEY"])
 ```
 
-- **Models:** use `qwen3.8` (general chat/tool use) or `qwen3.8-thinking` (slower,
-  reasons first); `qwen3.6` is an older alias. **Only use names the gateway lists:**
+- **Models:** default to `N0_LLM_MODEL`. Other common names: `claude-haiku` (Claude
+  Haiku 4.5, paid — the usual server default), `qwen3.8` (self-hosted, free) or
+  `qwen3.8-thinking` (slower, reasons first); `qwen3.6` is an older alias. **Only use names the gateway lists:**
   `GET $N0_LLM_BASE_URL/models` with the key returns the live list — check it before
   hardcoding a model, and never assume OpenAI/Anthropic names (`gpt-4o`,
   `claude-sonnet`) exist; an unknown name fails with "Invalid model name". Put the
@@ -2146,6 +2156,130 @@ app.use((req, res, next) => {
   next();
 });
 ```
+
+### Verifying identity: X-N0-Assertion
+
+The `X-Webauth-*` headers are plain text. Anything that can reach the container port
+(another pod in the cluster, via `INTERNAL`) can set them. For custom apps that make
+authorization decisions, verify the **signed assertion** instead. On every request that
+passes forward_auth for a signed-in user, n0 also sets `X-N0-Assertion`: a short-lived
+ES256 JWT (Caddy strips any client-supplied copy first, so a valid one can only come
+from n0).
+
+- **Issuer and keys (JWKS):** `iss` is the n0 instance's origin and the JWKS lives at
+  `<iss>/apps/.well-known/jwks.json` (public, no auth, cacheable). The issuers are:
+  Moon `https://moon.nzero.pro`, public server `https://app.nzero.pro`, staging
+  `https://app.privateprompt.tech`. (Not `privateprompt.tech`, which has no JWKS, and
+  not `app.moon.nzero.pro`.) Easiest: set the issuer from the origin of `N0_API_BASE`,
+  which the platform injects when the manifest declares `platform_scopes`; otherwise
+  configure it per instance. During key rotation the previous key stays published for
+  24h; the key is selected by the token's `kid` header.
+- **Algorithm:** `ES256` only.
+- **Lifetime:** 5 minutes (`exp` = `iat` + 300). Verify on each request; do not store it
+  as a session. Mint your own session after verifying if you need one.
+- **Claims:**
+
+| Claim | Value |
+|-------|-------|
+| `iss` | The instance origin (no trailing slash), as above |
+| `sub` | n0 user UUID (stable id; key your users on this) |
+| `email` | User email (empty string if none) |
+| `name` | Display name (may be empty) |
+| `workspace_id` | Workspace UUID that owns the app |
+| `access_level` | The app's access level (`workspace`, `admin`, `restricted` or `public`) |
+| `aud` | The app's **subdomain only** (e.g. `canvas-studio`), so an assertion for app A is rejected by app B |
+| `iat`, `exp` | Issued-at / expiry (Unix seconds) |
+
+**Take the audience from the app's own host.** Candidate and preview slots have their
+own subdomain, so do not hardcode it. Declare it in the manifest and use its first label:
+
+```json
+"env": { "N0_APP_DOMAIN": "{{APP_DOMAIN}}" }
+```
+
+`aud` = `N0_APP_DOMAIN.split(".")[0]`.
+
+**When the header is NOT there or does not prove much:**
+- It is absent on `public_paths` and for anonymous visitors of a `public` app (no
+  session, nothing to assert). Treat a missing header as unauthenticated; never fall
+  back to trusting `X-Webauth-*` for anything security-relevant.
+- On a `public` app, any signed-in user of the instance gets an assertion, so a valid
+  token proves who they are, **not** that they belong to `workspace_id`. Check
+  membership yourself if it matters.
+- Do not log or forward the header: anyone holding it can replay it for 5 minutes.
+
+**Python** (`pip install pyjwt cryptography`):
+
+```python
+import os
+import jwt
+from jwt import PyJWKClient
+
+N0_ISSUER = os.environ["N0_API_BASE"].split("/api/")[0]   # e.g. https://moon.nzero.pro
+MY_SUBDOMAIN = os.environ["N0_APP_DOMAIN"].split(".")[0]  # this app's aud
+jwks = PyJWKClient(f"{N0_ISSUER}/apps/.well-known/jwks.json")
+
+def verify_assertion(request):
+    token = request.headers.get("X-N0-Assertion")
+    if not token:
+        return None
+    try:
+        key = jwks.get_signing_key_from_jwt(token)
+        return jwt.decode(
+            token, key.key, algorithms=["ES256"],
+            audience=MY_SUBDOMAIN, issuer=N0_ISSUER,
+            options={"require": ["exp", "iat", "aud", "iss", "sub"]},
+        )   # claims["sub"], claims["email"], claims["workspace_id"], ...
+    except jwt.PyJWTError:
+        # bad signature / aud / iss / expired, unknown kid (PyJWKClientError),
+        # JWKS unreachable (PyJWKClientConnectionError): unauthenticated.
+        return None
+```
+
+**Node** (`npm i jose`):
+
+```javascript
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const N0_ISSUER = process.env.N0_API_BASE.split('/api/')[0];   // e.g. https://moon.nzero.pro
+const MY_SUBDOMAIN = process.env.N0_APP_DOMAIN.split('.')[0];  // this app's aud
+const jwks = createRemoteJWKSet(new URL(`${N0_ISSUER}/apps/.well-known/jwks.json`));
+
+export async function verifyAssertion(req) {
+  const token = req.headers['x-n0-assertion'];
+  if (!token) return null;
+  try {
+    const { payload } = await jwtVerify(token, jwks, {
+      algorithms: ['ES256'],
+      issuer: N0_ISSUER,
+      audience: MY_SUBDOMAIN,
+    });                                       // exp is checked automatically
+    return payload;                           // payload.sub, payload.email, ...
+  } catch {
+    return null;                              // treat as unauthenticated
+  }
+}
+```
+
+(`N0_API_BASE` is only injected with `platform_scopes`; without it, set the issuer from
+config. Never take issuer or audience from the request.)
+
+**Which login to use - decision rule:**
+
+- **Identity only** (who is the user, log them into my app): **verify the assertion.** No
+  workspace admin, no browser step, no client secret, and it can't be forged. This is the
+  default for custom apps.
+- **The app must call the n0 API as the user** (DMs, channels, boards "as me"): use
+  "Sign in with n0" OAuth (see "Acting as the Signed-in Person" above). Registering an
+  OAuth app is **session-only and admin-only** (a PAT cannot create it; the caller must
+  be a workspace admin in a browser), so **tell the user up front**: "A workspace admin
+  must create an OAuth app in Workspace settings -> OAuth apps, named `<app name>`, with
+  redirect URI `https://<subdomain>.<apps domain>/auth/callback` and scopes `<...>`. The
+  client secret is shown once; they must then set it as an app secret." Wiring: declare
+  e.g. `"OAUTH_CLIENT_SECRET": ""` in the manifest env, then a workspace admin sets the
+  value through the app's Secrets dialog, `workspace_admin_set_app_secrets` or
+  `PUT .../apps/{id}/secrets`, and redeploys (overwriting an existing secret needs a
+  workspace admin). Do not start building the OAuth flow until that exists.
 
 ### When to Configure SSO
 
