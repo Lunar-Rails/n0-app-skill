@@ -198,11 +198,15 @@ is revoked as soon as the PAT that minted it is revoked.
 server revokes all but your 5 newest, so minting per command can revoke a token another
 session is still using. Only when Gitea rejects the token with **401/403**, run
 `rm -f "$HOME/.n0/gitea-token-$WS_ID.json"` and re-run the snippet. Never mint in a
-retry or polling loop. Build failures, 404s and network errors are not token problems.
+retry or polling loop. Build failures, 404s, network errors and a `302` to the n0
+login (wrong auth header shape, see below) are not token problems.
 
 **RULES (do not violate — SSH and interactive logins break in the sandbox):**
 - ✅ Do all git operations over **HTTPS** with the Gitea token embedded in the remote URL:
   `https://<username>:<gitea-token>@<gitea-host>/<org>/<repo>.git`
+- ✅ Call the Gitea REST API (`https://<gitea-host>/api/v1/...`) with the header
+  `Authorization: token $GITEA_TOKEN` — never `curl -u user:token` or `?token=`; those
+  are sent to the n0 login (`302`) instead of reaching Gitea.
 - ❌ **NEVER** use an SSH git remote (`git@...`, `ssh://...`) — no SSH keys exist in the sandbox.
 - ❌ **NEVER** use email/password `/auth/login` — use the PAT Bearer token instead.
 - ❌ **NEVER** create Gitea tokens via the web UI or via `gitea admin ... generate-access-token` over SSH — use the `gitea/token/` endpoint above.
@@ -1038,19 +1042,22 @@ on `localhost`. Concurrent jobs on one runner share that network namespace, so t
 publishing the same port can clash — pick distinct host ports when that matters, and
 wait for readiness (`pg_isready`, a retry loop) before running tests.
 
-**Calling the Gitea API from a workflow — avoid it if you can.** Clone, push, tags and
-releases-by-tag work over git HTTPS; images go through the registry; deploys go through
-the n0 API. `/api/v1/*` on the public Gitea host sits behind n0's sign-in (forward_auth)
-and is **not** opened for tokens by default, so a call such as
-`curl -H "Authorization: token …" https://<gitea-host>/api/v1/…` usually gets a
-`302` to the n0 login page instead of JSON. Whether it passes depends on how the
-workspace's Gitea app is exposed: a workspace admin can list `/api/v1/*` in the Gitea
-app's public routes (`PUT /api/v1/workspaces/{wid}/apps/{gitea_app_id}/public-routes`,
-`{"paths": ["/api/v1/*"]}`) — Gitea then authenticates those calls itself with the token
-— and the token-passthrough flag (`api_bearer_bypass`) can only be set by a platform
-operator. Check before relying on it: a request with a bogus token should answer
-`401` JSON from Gitea, not a redirect. Never "fix" it by switching back to a loopback
-address — that is unreachable from CI. Keep any token in a secret.
+**Calling the Gitea API (from a workflow or an agent).** Prefer the paths that need no
+API: clone, push, tags and releases-by-tag work over git HTTPS; images go through the
+registry; deploys go through the n0 API. When you do need `/api/v1/*` on the public
+Gitea host, **send the token in the header, exactly like this**:
+`curl -H "Authorization: token $GITEA_TOKEN" https://<gitea-host>/api/v1/…`
+(`Authorization: Bearer <token>` works too; in a workflow use `${{ secrets.GITEA_TOKEN }}`
+or a token kept in a secret). Only that header shape skips n0's sign-in (forward_auth)
+and reaches Gitea, which checks the token itself. Basic auth (`curl -u user:token`),
+`?token=` / `?access_token=` query parameters, a missing token, and session cookies all
+get a `302` to the n0 login page instead of JSON — fix the request, don't retry it.
+A token Gitea rejects answers `401`/`403` JSON (`Only signed in user is allowed to call
+APIs.`): re-mint it as described in the token section, once. If even a correct
+`Authorization: token` call gets the `302`, the workspace's Gitea predates this route
+— ask a platform operator to enable it (`reconcile_gitea_api_access`); do **not** add
+`/api/v1/*` to the Gitea app's public routes, and never "fix" it by switching back to a
+loopback address — that is unreachable from CI.
 
 **Migrating an existing workflow — checklist:**
 - [ ] `grep -nE '127\.0\.0\.1|localhost:|k3s|kubectl|docker\.sock|svc\.cluster\.local|privileged|/api/v1' .gitea/workflows/* .github/workflows/*`
