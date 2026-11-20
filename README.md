@@ -60,9 +60,10 @@ Or copy `SKILL.md` into your project's `.claude/skills/n0-app/` directory.
 N0 deploys apps as Docker containers on Kubernetes (k3s), with:
 
 - **Per-workspace isolation** — each workspace gets its own Gitea, Supabase, and app namespace
-- **Automatic SSO** — Caddy reverse proxy injects `X-Webauth-*` headers
+- **Automatic SSO** — Caddy's forward_auth signs users in; apps verify the signed `X-N0-Assertion` header (off-the-shelf apps read `X-Webauth-*`). n0's own cookies never reach an app
 - **Gitea Actions CI/CD** — build and push images to workspace container registry
-- **Vault secrets management** — secrets stored in HashiCorp Vault, injected at deploy time
+- **Vault secrets management** — secrets stored in HashiCorp Vault, injected at deploy time as env vars or mounted read-only as `secret_files` (OAuth JSON, keys)
+- **One-shot migrations and idle sleep** — migration services run once per deploy as Jobs; idle single-service apps scale to zero and wake on the next request (`always_on` opts out)
 - **Caddy routing** — automatic TLS, DNS, and reverse proxy setup
 
 ## N0 API
@@ -72,7 +73,8 @@ The skill uses the N0 API via a Personal Access Token (PAT). The same token can 
 - **Channels & Messages** — post messages, read channels (`channels:read/write`)
 - **Boards & Tasks** — create/move tasks, manage columns (`boards:read/write`)
 - **Projects** — organize apps, agents, notes, boards into projects (`projects:read/write`)
-- **Notes** — create rich-text notes with ProseMirror JSON (`notes:read/write`)
+- **Pages** — create rich-text pages with ProseMirror JSON (`pages:read/write`; `notes:*` is a deprecated alias)
+- **To-dos** — personal and shared to-do lists (`todos:read/write`)
 - **Connectors** — create custom tool connectors (`connectors:read/write`)
 - **Supabase** — query and execute SQL (`supabase:read/write`)
 - **Geocoding** — forward/reverse geocoding (`geo:read`)
