@@ -298,24 +298,39 @@ Returns the detailed manifest format for creating custom connectors, including:
 | `workspaces:read` | List workspaces you belong to |
 | `members:read` | List members of your workspaces |
 | `users:read` | Search users and view profiles |
+| `teams:read` / `teams:write` | List teams and their members / create, edit and delete teams (admins) |
 | `channels:read` | Read messages in channels |
 | `channels:write` | Send messages and create channels |
 | `dms:read` | List and read DM conversations |
 | `dms:write` | Create DMs and send direct messages |
+| `files:read` | Download files and list channel files/links |
+| `files:write` | Upload files and get presigned upload URLs |
+| `notifications:read` / `notifications:write` | List notifications and preferences / mark read, update preferences, push tokens |
 | `boards:read` | View boards, columns, and tasks |
 | `boards:write` | Create, update, move, and delete tasks |
+| `todos:read` | Read your To-dos and the ones shared with you |
+| `todos:write` | Create, edit, complete, share and delete your To-dos |
 | `projects:read` | View projects, their items, members, and activity |
 | `projects:write` | Create, update, move, and delete projects and manage their items |
-| `notes:read` | Read notes and note revisions you have access to |
-| `notes:write` | Create, edit, move, and delete notes |
+| `pages:read` | Read pages and page revisions you have access to |
+| `pages:write` | Create, edit, move, and delete pages |
+| `notes:read` / `notes:write` | Deprecated aliases of `pages:read` / `pages:write` |
 | `apps:read` | List hosted apps and definitions |
 | `apps:write` | Deploy, redeploy, stop, and manage apps |
+| `apps:secrets` | Set and generate app secrets and secret files (values are never returned) |
 | `connectors:read` | List custom connectors and their status |
 | `connectors:write` | Create, update, delete, approve, and test connectors |
+| `skills:read` / `skills:write` | View agent skills and grants / create, import, delete and grant skills |
+| `bridges:read` / `bridges:write` | View / connect chat bridges (Slack, Teams) and their channel mappings |
+| `vault:read` / `vault:write` | Personal vault item metadata, grants and audit log (never values) / manage items and grants |
+| `feedback:read` / `feedback:write` | Read the workspace's feedback intake (admins) / submit product feedback |
 | `gitea:write` | Create repos and get Gitea access tokens |
 | `supabase:read` | Read Supabase credentials and query data |
 | `supabase:write` | Execute SQL against Supabase databases |
-| `geo:read` | Use geocoding for your workspaces |
+| `geo:read` | Use map tiles config and geocoding for your workspaces |
+
+`agents:invoke` / `agents:stream` exist only on agent-scoped keys minted from an
+agent's settings; a PAT cannot request them.
 
 The live list is always available at `GET /api/v1/tokens/scopes/`.
 
@@ -680,6 +695,7 @@ that aren't in the upstream compose — this is the #1 cause of deployment failu
 | `entrypoint` | No | string | Which service to expose to the internet. Default: `"web"` |
 | `cpu` | No | number | Default CPU limit per service. Default: `1.0` |
 | `connectors` | No | array | Connectors this app publishes (see "App-Published Connectors" below) |
+| `always_on` | No | boolean | `true` keeps the app out of idle sleep (see "Idle Sleep") |
 
 **Service fields:**
 
@@ -690,7 +706,9 @@ that aren't in the upstream compose — this is the #1 cause of deployment failu
 | `env` | No | object | Environment variables as key-value strings |
 | `volumes` | No | object | Named volume -> container path mapping |
 | `config_files` | No | object | Files to write into volumes before container starts |
+| `secret_files` | No | object | `{"/abs/path": {"label", "mode"}}` — credential files whose content is set in Vault (see "Secret Files") and mounted read-only |
 | `depends_on` | No | string[] | Service names that must start before this one |
+| `one_shot` | No | boolean | `true`: the service runs once per deploy as a Job and exits (a migration). Default: by name (see "Migration / Init Services") |
 | `memory_mb` | No | number | Memory limit in MB. Default: `256` |
 | `cpu` | No | number | CPU limit (fractional). Default: `0.5` |
 | `command` | No | string[] | Override the default container command |
@@ -702,6 +720,34 @@ that aren't in the upstream compose — this is the #1 cause of deployment failu
 | `{{APP_URL}}` | `https://{subdomain}.apps.privateprompt.tech` |
 | `{{APP_DOMAIN}}` | `{subdomain}.apps.privateprompt.tech` |
 | `{{APP:<slug>:<field>}}` | Cross-app reference (see below) |
+
+`{{APP_URL}}` / `{{APP_DOMAIN}}` are always the app's canonical
+`<subdomain>.apps.<domain>` host, also when the app has custom domains.
+
+#### Custom domains
+
+Where the server has custom domains switched on (Studio → app → Settings →
+**Custom domains**, or the API below; workspace capability
+`custom_app_domains`), the app's creator and workspace admins can serve
+the app on their own hostnames too (app Admin/Editor grants can view and recheck) (up to 5, apex domains allowed):
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $N0_API_TOKEN" -H "Content-Type: application/json" \
+  "$N0_API_BASE/workspaces/$WS_ID/apps/$APP_ID/domains" -d '{"hostname": "shop.example.com"}'
+# → dns_records: CNAME shop.example.com → <subdomain>.apps.<domain>
+#                TXT  _n0-verify.shop.example.com "n0-verify=<token>"
+curl -s -X POST -H "Authorization: Bearer $N0_API_TOKEN" \
+  "$N0_API_BASE/workspaces/$WS_ID/apps/$APP_ID/domains/$DOMAIN_ID/recheck"   # verify now
+# GET .../domains lists them (apps:read); DELETE .../domains/$DOMAIN_ID removes one (apps:write)
+```
+
+The name must point only at this server (no CDN proxy) and keep its TXT record:
+it is re-checked daily and removed after three failed days. On a custom domain
+the app still receives `Host: <subdomain>.apps.<domain>`; the host the browser
+used is in `X-Forwarded-Host`. Build absolute URLs from `X-Forwarded-Host` (most
+frameworks do when they trust the proxy), or use relative URLs. Next.js Server
+Actions need no extra config: they compare `Origin` with `X-Forwarded-Host`.
+Sign-in on a custom domain goes through the n0 login and back automatically.
 
 #### Cross-App Environment References
 
@@ -720,8 +766,13 @@ Apps can reference other running apps in their environment variables using the `
 **Use `INTERNAL` for server-to-server calls between apps.** Public app URLs
 (`{{APP:<slug>:URL}}`) sit behind Caddy forward_auth when the target app's
 `access_level` is `restricted`/`workspace`/`admin`, so backend HTTP calls to them get a
-302 to the login page. The `INTERNAL` address bypasses the auth proxy entirely
-(in-cluster traffic between hosted apps is permitted).
+302 to the login page. The `INTERNAL` address bypasses the auth proxy entirely.
+A hosted app accepts in-cluster traffic only from the platform, from its own
+services, and from the apps it lists in its **own** manifest under
+`"allow_internal_from": ["<caller subdomain>", ...]`. To let `shop-web` call
+`shop-api` internally, put `"allow_internal_from": ["shop-web"]` in shop-api's
+manifest and redeploy shop-api. Every other pod, agent sandboxes included, must
+use the public URL. A direct call from them times out.
 
 Because `INTERNAL` skips the auth proxy, anything in the cluster that can reach a
 container port can send it requests with **forged plain `X-Webauth-*` headers**. Never
@@ -881,7 +932,7 @@ jobs:
 ```
 
 Replace `UPSTREAM_REGISTRY/UPSTREAM_IMAGE:UPSTREAM_TAG` with the actual upstream image
-(e.g., `ghcr.io/toeverything/affine:stable`), `DETECT_DEFAULT_BRANCH` with the repo's
+(e.g., `docker.io/outlinewiki/outline:latest`), `DETECT_DEFAULT_BRANCH` with the repo's
 actual default branch (e.g., `main`, `canary`, `master`), and `LOWERCASE_ORG/LOWERCASE_REPO`
 with the all-lowercase org and repo name.
 
@@ -1246,7 +1297,7 @@ One container serving a web app. The image is built from the repo's Dockerfile.
 }
 ```
 
-### Upstream pre-built app (e.g., AFFiNE, Outline, WikiJS)
+### Upstream pre-built app (e.g., Outline, WikiJS)
 Using official images from GHCR/Docker Hub with a migration init service.
 
 ```json
@@ -1608,6 +1659,33 @@ The main `web` service should `depends_on` the migration service.
 doesn't serve traffic — this is a required field in the schema. Use the same
 port as the main app.
 
+**One-shot services run as Jobs (Kubernetes servers).** A service is one-shot
+when it sets `"one_shot": true`, or — without the field — when a whole word of
+its name (split on `-`, `_`, `.`) is `migration`, `migrations` or `migrate`
+(`migration`, `db-migrate`; not `migrator-api`). Set `"one_shot": false` to keep
+such a name a normal long-running service, and `"one_shot": true` for an
+init/seed service with another name. The entrypoint is never one-shot.
+
+- Each deploy deletes the previous Job and runs it once (`restartPolicy: Never`,
+  a few retries for a database that is still starting). It gets no Service, so
+  nothing can call it. The finished Job and its pod stay until the next deploy,
+  so its log stays readable in the app's logs.
+- **First deploy:** the entrypoint waits for the one-shots to finish; an
+  attempt still running after ~75 s counts as idle and the web starts anyway
+  (with a warning). **Redeploy:** it does not wait — the old version is already down,
+  so the web starts while the migration runs. Make the web tolerate a schema
+  that is still migrating (or retry its startup), and keep migrations backward
+  compatible.
+- A failed one-shot never blocks a deploy or redeploy: it shows as a deploy
+  warning and the app health reads `unhealthy`. It **does** fail a promote
+  (candidate → production). Check the deploy warnings after every deploy.
+- A one-shot must exit. A service that keeps running (a server, `sleep
+  infinity`, a watcher) is not one-shot: name it otherwise or set
+  `"one_shot": false`.
+- Apps deployed before this ran their migration as a Deployment that restarted
+  it forever after exit 0. The platform converts those that are visibly
+  looping to Jobs (hourly); a redeploy converts any at once.
+
 ## Database Images
 
 ### Standard PostgreSQL
@@ -1630,7 +1708,7 @@ For most apps that just need a relational database:
 
 ### PostgreSQL with pgvector (AI/embeddings)
 For apps that use vector embeddings, similarity search, or AI features
-(e.g., AFFiNE, Outline with AI, anything using OpenAI embeddings):
+(e.g., Outline with AI, anything using OpenAI embeddings):
 
 ```json
 {
@@ -1803,7 +1881,7 @@ service container:
 |---------|-------|
 | `N0_LLM_BASE_URL` | OpenAI-compatible endpoint, ends in `/v1` |
 | `N0_LLM_API_KEY` | The app's own key |
-| `N0_LLM_MODEL` | The model to use by default: the server's default model (Claude Haiku 4.5, `claude-haiku`, unless the operator changed it) if your `models` policy allows it, else your first allowed model |
+| `N0_LLM_MODEL` | The model to use by default: the server's default model (Claude Haiku 5.5, `claude-haiku`, unless the operator changed it) if your `models` policy allows it, else your first allowed model |
 
 Use any OpenAI-compatible client, server-side:
 
@@ -1822,7 +1900,9 @@ llm = OpenAI(base_url=os.environ["N0_LLM_BASE_URL"], api_key=os.environ["N0_LLM_
 ```
 
 - **Models:** default to `N0_LLM_MODEL`. Other common names: `claude-haiku` (Claude
-  Haiku 4.5, paid — the usual server default), `qwen3.8` (self-hosted, free) or
+  Haiku 5.5, paid — the usual server default; omit `temperature`/`top_p`/`top_k`
+  (only the defaults are accepted); it thinks by default, so leave room in `max_tokens`
+  and, in tool loops, send each assistant message's `thinking_blocks` back unchanged), `qwen3.8` (self-hosted, free) or
   `qwen3.8-thinking` (slower, reasons first); `qwen3.6` is an older alias. **Only use names the gateway lists:**
   `GET $N0_LLM_BASE_URL/models` with the key returns the live list — check it before
   hardcoding a model, and never assume OpenAI/Anthropic names (`gpt-4o`,
@@ -1987,6 +2067,64 @@ runtime anyway (see the merge order above). Reverting the commit does not remove
 from history: the secret must be rotated. If you have a credential and no way to
 store it, say so and ask, rather than compiling it into an artifact.
 
+### Secret Files (credentials that must be a file)
+
+Some credentials have to be a **file**: a Google OAuth client JSON, a
+service-account key, a TLS private key. Never put them in `config_files` (the
+content lands in git) or base64 them into an env var (env leaks through process
+listings and crash dumps). Declare them per service in `secret_files` — path and
+label only — and set the content in Vault:
+
+```json
+"services": {
+  "web": {
+    "image": "...",
+    "secret_files": {
+      "/run/secrets/gmail-oauth.json": { "label": "Gmail OAuth JSON", "mode": "0400" }
+    }
+  }
+}
+```
+
+Then set the content (as an agent):
+
+```
+workspace_admin_set_app_secrets(
+  app_id="<the hosted app's id>",
+  secret_files={"web": {"/run/secrets/gmail-oauth.json": "<file contents>"}}
+)
+```
+
+…or a human uploads it in the app's **Settings → Environment → Secret files**,
+or `PUT .../apps/{id}/secrets` with
+`{"secret_files": {"web": {"/run/secrets/gmail-oauth.json": "<text>"}}}`
+(`{"content_base64": "..."}` for binary, `null` to remove). **Redeploy** to apply.
+
+Rules:
+- Path: absolute, at least `/<dir>/<dir>/<file>`, letters/digits/`._-@+=,`, no `.`/`..`
+  segments, not under `/proc`, `/sys`, `/dev`, `/usr`, `/bin`, `/lib`… and not a
+  directory the image needs (`/etc/ssl`, `/var/lib`, …). Use `/run/secrets/...`.
+- The file's **directory is mounted read-only** (no `subPath`, so updates
+  propagate) and hides whatever the image had in it — use a directory of its
+  own. It must not overlap a `volumes`/`config_files` mount.
+- `mode`: `"0400"` (default), `"0440"` or `"0444"`. The file is owned by root
+  with the pod's group (1000), which every process in the container has, so the
+  app can always read it; the kubelet adds group read, so `0400` is effectively
+  `0440`. A root-only file is not possible (`"owner": "root"` is refused).
+- At most 20 files per service, 64 KiB per file and 768 KiB per service in
+  total. Unknown fields (e.g. `content`) are rejected: the manifest never
+  carries the content.
+- PR previews share their production app's secret files (as they share its env
+  secrets). A candidate gets none of production's: set them for the candidate
+  with the tool or `PUT .../apps/{candidate id}/secrets`.
+- Kubernetes servers only — the Docker backend refuses an app with
+  `secret_files`.
+- The API and the dialog show only path, label, mode, set/not set and when it
+  was updated — never the content. Setting a file that is not set yet is open to
+  whoever can manage the app; **replacing or removing** a set one needs the same
+  permission as replacing any configured secret.
+- A declared file with no content yet is simply not mounted (deploy warning).
+
 ### Managing Secrets via the UI
 
 Users can manage secrets directly from the N0 web interface -- no SSH or Vault CLI access needed:
@@ -2055,6 +2193,7 @@ vault kv metadata delete secret/clovr/workspaces/$WS/app-secrets/{app-type}
 ### Checklist for Secrets
 
 - [ ] No real secrets in `n0-app.json` (use empty strings or dict format with `"secret": true`)
+- [ ] Credentials that must be files (OAuth JSON, keys) are declared in `secret_files` and set via the tool/UI -- never in `config_files`
 - [ ] Secret fields use dict format where possible: `{ "secret": true, "generate": true, "label": "..." }`
 - [ ] All sensitive env vars stored via the tool, the API, or the Secrets UI --
       never written straight to the legacy `secret/clovr/apps/...` tree
@@ -2071,7 +2210,9 @@ vault kv metadata delete secret/clovr/workspaces/$WS/app-secrets/{app-type}
 
 1. User visits `https://myapp.apps.privateprompt.tech`
 2. Caddy intercepts and sends a sub-request to Django's `/apps/auth-check/` endpoint
-3. Django checks the user's **session cookie** (shared across all `*.privateprompt.tech` subdomains)
+3. Django checks the user's n0 sign-in for this app host: the host-only app cookie
+   `__Host-n0_app_session`, set when the entry token from the n0 web app is
+   exchanged on the app host
 4. If authenticated and authorized → Caddy injects these headers into the request to the container:
 
 | Header | Value | Example |
@@ -2080,7 +2221,27 @@ vault kv metadata delete secret/clovr/workspaces/$WS/app-secrets/{app-type}
 | `X-Webauth-Email` | Full email address | `rasmus@clovrlabs.com` |
 | `X-Webauth-Fullname` | Display name | `Rasmus Schlunsen` |
 
-5. The app reads these headers and auto-creates/logs in the user — **zero-click SSO**
+5. The app logs the user in — **zero-click SSO**. Off-the-shelf apps (Gitea, Grafana, Outline, n8n) only understand these plain headers, so they read them. **Apps you build yourself must not: they verify the signed `X-N0-Assertion` instead** (see "Verifying identity: X-N0-Assertion"). The plain headers can be forged by anything that reaches the container port.
+
+### Cookies on app hosts
+
+- An app never sees n0's own cookies: the n0 session and CSRF cookies are host-only
+  (`__Host-`) on the n0 hosts, and the platform cookies — including the app host's
+  `__Host-n0_app_session` and the old parent-domain `sessionid` / `csrftoken` —
+  are stripped from the `Cookie` header before the request reaches the container.
+  Identify the user only from `X-N0-Assertion` (or the `X-Webauth-*` headers for
+  off-the-shelf apps), never from a cookie.
+- The app's own cookies pass through unchanged. Keep them host-only (no `Domain`
+  attribute): never set a cookie on the parent
+  domain (`.apps.<domain>` or `.<domain>`) — every other app's host would receive it.
+- Don't name an app cookie `sessionid`, `csrftoken`, `__Host-sessionid`,
+  `__Host-csrftoken` or `__Host-n0_app_session` — those are stripped.
+- Responses get `Cross-Origin-Resource-Policy: cross-origin` (so the app loads in
+  the n0 web app's frame). On a framed request (`Sec-Fetch-Dest: iframe`) the
+  app's own `X-Frame-Options` and `Content-Security-Policy` are replaced by n0's
+  `frame-ancestors` policy (n0 web app, the workspace host, other apps); top-level
+  responses keep the app's CSP and get that policy as a second one. Public-path
+  responses keep their own framing headers.
 
 ### Configuring Apps for SSO
 
@@ -2126,19 +2287,23 @@ If the app you're deploying supports **reverse proxy authentication**, enable it
 }
 ```
 
-#### Backstage / Custom Apps
-For custom apps, read the headers in your middleware:
+#### Custom Apps (verify the assertion, never the plain headers)
+For apps you build, do **not** trust `X-Webauth-Email` and friends: any pod or process that
+can reach the container port can set them. Verify the signed `X-N0-Assertion` in your
+middleware (the `verify_assertion` / `verifyAssertion` helpers are in "Verifying identity:
+X-N0-Assertion" below) and take the user from its claims:
 ```python
 # Django middleware example
-class ReverseProxyAuthMiddleware:
+class N0AssertionAuthMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
     def __call__(self, request):
-        email = request.META.get("HTTP_X_WEBAUTH_EMAIL")
-        username = request.META.get("HTTP_X_WEBAUTH_USER")
-        fullname = request.META.get("HTTP_X_WEBAUTH_FULLNAME")
-        if email:
+        claims = verify_assertion(request)   # None = unauthenticated
+        if claims:                           # verify_assertion requires sub
             user, _ = User.objects.get_or_create(
-                email=email,
-                defaults={"username": username, "full_name": fullname}
+                n0_user_id=claims["sub"],     # key on the stable sub, not the email
+                defaults={"email": claims.get("email", ""), "full_name": claims.get("name", "")},
             )
             request.user = user
         return self.get_response(request)
@@ -2146,12 +2311,10 @@ class ReverseProxyAuthMiddleware:
 
 ```javascript
 // Express.js middleware example
-app.use((req, res, next) => {
-  const email = req.headers['x-webauth-email'];
-  const username = req.headers['x-webauth-user'];
-  const fullname = req.headers['x-webauth-fullname'];
-  if (email) {
-    req.user = { email, username, fullname };
+app.use(async (req, res, next) => {
+  const claims = await verifyAssertion(req);   // null = unauthenticated
+  if (claims) {
+    req.user = { id: claims.sub, email: claims.email, name: claims.name };
   }
   next();
 });
@@ -2160,8 +2323,9 @@ app.use((req, res, next) => {
 ### Verifying identity: X-N0-Assertion
 
 The `X-Webauth-*` headers are plain text. Anything that can reach the container port
-(another pod in the cluster, via `INTERNAL`) can set them. For custom apps that make
-authorization decisions, verify the **signed assertion** instead. On every request that
+(another pod in the cluster, via `INTERNAL`) can set them. **Verifying the signed assertion
+is the default for every app you build** (scaffold it into the first version, not as a later
+hardening step); plain headers are only for off-the-shelf apps that cannot verify a JWT. On every request that
 passes forward_auth for a signed-in user, n0 also sets `X-N0-Assertion`: a short-lived
 ES256 JWT (Caddy strips any client-supplied copy first, so a valid one can only come
 from n0).
@@ -2189,6 +2353,19 @@ from n0).
 | `access_level` | The app's access level (`workspace`, `admin`, `restricted` or `public`) |
 | `aud` | The app's **subdomain only** (e.g. `canvas-studio`), so an assertion for app A is rejected by app B |
 | `iat`, `exp` | Issued-at / expiry (Unix seconds) |
+| `n0_via` | Which n0 path sent the request: `edge` (a browser through n0's proxy — people *and* agents), `agent-proxy` (an agent using the app's published connector), `connector` (a platform-identity or MCP connector). A path, not a kind of caller. Older tokens lack it. |
+| `n0_bot` | `true` when the user in `sub` is an agent (bot) user. Not enough on its own to spot agents: see below. Older tokens lack it. |
+| `n0_agent` | On `agent-proxy` calls: the id of the agent making the call. |
+| `n0_driver` | On `agent-proxy` calls, when known: the n0 user UUID of the person driving the agent's run (may differ from `sub`, the granter). |
+
+Every request n0 sends into your app on someone's behalf carries the assertion: browser
+requests and also the calls agents and connectors make as the granting user. So require
+a valid assertion wherever you attribute a request to a user, and ignore `X-Webauth-*`
+for anything security-relevant. To tell agents from people: a request comes from an agent when `n0_bot` is true **or** `n0_via` is `agent-proxy` (on agent-proxy calls `sub` is the human granter, so `n0_bot` is false); `connector` calls may also be agent-initiated.
+
+On `agent-proxy` and `connector` calls, `sub`/`email` are the **granting user**: the
+person whose connection the agent uses, not the agent (`n0_agent` names it on
+`agent-proxy` calls). Authorize those calls as that person, knowing an agent sends them.
 
 **Take the audience from the app's own host.** Candidate and preview slots have their
 own subdomain, so do not hardcode it. Declare it in the manifest and use its first label:
@@ -2227,7 +2404,7 @@ def verify_assertion(request):
         key = jwks.get_signing_key_from_jwt(token)
         return jwt.decode(
             token, key.key, algorithms=["ES256"],
-            audience=MY_SUBDOMAIN, issuer=N0_ISSUER,
+            audience=MY_SUBDOMAIN, issuer=N0_ISSUER, leeway=30,   # clock skew
             options={"require": ["exp", "iat", "aud", "iss", "sub"]},
         )   # claims["sub"], claims["email"], claims["workspace_id"], ...
     except jwt.PyJWTError:
@@ -2253,6 +2430,7 @@ export async function verifyAssertion(req) {
       algorithms: ['ES256'],
       issuer: N0_ISSUER,
       audience: MY_SUBDOMAIN,
+      clockTolerance: '30s',                  // clock skew
     });                                       // exp is checked automatically
     return payload;                           // payload.sub, payload.email, ...
   } catch {
@@ -2284,7 +2462,7 @@ config. Never take issuer or audience from the request.)
 ### When to Configure SSO
 
 - **Apps with built-in reverse proxy auth support** (Gitea, Grafana, Outline, WikiJS, etc.): Set the appropriate env vars in the manifest
-- **Custom apps**: Add middleware to read `X-Webauth-*` headers and auto-create/authenticate users
+- **Custom apps (the ones you build)**: Add middleware that verifies `X-N0-Assertion` and auto-creates/authenticates users from its claims. Do not read `X-Webauth-*` in custom code, and declare `N0_APP_DOMAIN` (and `platform_scopes` or an issuer setting) so the verifier can be configured
 - **Apps with their own auth only** (e.g., Supabase, n8n): Skip SSO config — N0 still handles access control at the Caddy layer, but the app manages its own internal user sessions
 
 ### Access Control Levels
@@ -2319,10 +2497,13 @@ Matching semantics — **Caddy governs live traffic**, so write patterns for it:
 
 - `/health` — exact match
 - `/api/webhook/*` — prefix match (everything **under** `/api/webhook/`)
-- Caddy's `/x/*` does **not** match the bare path `/x`, so list both when the
-  endpoint is hit with and without a trailing segment: `["/x", "/x/*"]`
-- Caddy matching is case-insensitive and allows `*` anywhere; the Django
-  fallback check is case-sensitive and only honours a trailing `*`
+- `/x/*` also covers the bare `/x` (n0 adds it; not for `/*` or a pattern with
+  a glob before the last segment)
+- Matching is case-insensitive and allows `*` anywhere
+- A request target with a `..` segment (in any encoding: `%2e%2e`, `..;/`,
+  backslashes …) or starting with `//` is answered `400` at the edge, on public
+  and gated routes alike, and never reaches the app. Don't build URLs that need
+  them.
 
 **A public path removes all platform authentication from that route, so the app
 itself must authenticate every publicly-routed endpoint** — verify the provider's
@@ -2331,15 +2512,11 @@ bearer token on anything else.
 
 ### API Token Passthrough
 
-Requests to `/api/*` or `/graphql` carrying an `Authorization: Bearer *` header can bypass forward_auth, letting external clients (CI/CD, CLI tools, mobile apps) authenticate directly with the app's own token system instead of an N0 session cookie.
-
-**This is opt-in per app and OFF for every custom app.** It is gated on the
-`api_bearer_bypass` flag, which is auto-enabled only for an allowlist of built-in
-app types (currently just `affine`) and is read-only over the API — it was
-deliberately narrowed because a blanket bypass exposed one app's unauthenticated
-admin endpoints. Do not design a connector or API client around this bypass: for
-a custom app, add the specific `/api/...` routes to `public_paths` instead and
-enforce your own bearer token inside the app.
+There is none. An `Authorization` header on `/api/*` or `/graphql` does **not**
+skip the n0 sign-in gate (the old per-app opt-in was removed once no app used
+it). For external clients (CI/CD, CLI tools, mobile apps), add the specific
+`/api/...` routes to `public_paths` and enforce your own bearer token inside the
+app.
 
 ### SSO Checklist
 
@@ -2347,7 +2524,7 @@ When generating a manifest for an app that supports reverse proxy auth:
 
 - [ ] Enable reverse proxy / header-based authentication in the app's env vars
 - [ ] Set the trusted proxy to `127.0.0.1` (the Caddy reverse proxy)
-- [ ] Map `X-Webauth-User`, `X-Webauth-Email`, and `X-Webauth-Fullname` to the app's expected header names
+- [ ] Map `X-Webauth-User`, `X-Webauth-Email`, and `X-Webauth-Fullname` to the app's expected header names (off-the-shelf apps only; custom apps verify `X-N0-Assertion` instead and declare `N0_APP_DOMAIN`)
 - [ ] Enable auto-registration so users are created on first visit
 - [ ] Disable the app's built-in registration page (users come through N0)
 - [ ] Disable the app's built-in login page if possible (users are already authenticated)
@@ -2363,14 +2540,14 @@ Apps can **publish connectors** that workspace users and agents can use. When an
 1. App declares `connectors` in its `n0-app.json` manifest
 2. On deploy, N0 creates `ConnectorDefinition` records for each declared connector
 3. Users see them in **Connectors → App Connectors** tab and click **Enable**
-4. Agents call the app's API through a proxy — N0 injects `X-Webauth-*` headers with the granting user's identity
-5. The app receives the same identity headers as browser requests — **zero app-side auth code needed**
+4. Agents call the app's API through a proxy — N0 sends the granting user's identity as plain `X-Webauth-*` headers **and** a signed `X-N0-Assertion` (`n0_via: agent-proxy`, `n0_agent` names the agent)
+5. The app receives the same identity as browser requests. Custom apps verify the assertion (a few lines, see "Verifying identity: X-N0-Assertion"); the plain headers are only for apps that cannot verify a JWT
 
 ### Auth Types
 
 #### `platform_identity` (default, recommended)
 
-No credentials are stored or exchanged. The platform proxies agent requests with the user's identity headers. The app just reads `X-Webauth-*` headers (same as browser access via SSO).
+No credentials are stored or exchanged. The platform proxies agent requests with the user's identity. The app verifies the signed `X-N0-Assertion` (same as browser access via SSO) and reads the user from its claims; it must not trust the plain `X-Webauth-*` headers.
 
 **This is the preferred auth type** — it's zero-config for the app and eliminates credential management entirely.
 
@@ -2397,7 +2574,7 @@ For apps that have their own authentication system and can't use reverse proxy a
 
 ### Example: Platform Identity Connector
 
-This is the most common pattern. The app just reads `X-Webauth-*` headers:
+This is the most common pattern. The app verifies `X-N0-Assertion` (helpers in "Verifying identity: X-N0-Assertion"):
 
 ```json
 {
@@ -2418,24 +2595,27 @@ This is the most common pattern. The app just reads `X-Webauth-*` headers:
 }
 ```
 
-The app's API endpoints just need to read the identity headers:
+The app's API endpoints verify the assertion and use its claims:
 
 ```python
-# FastAPI example
-from fastapi import Request
+# FastAPI example (verify_assertion from "Verifying identity: X-N0-Assertion")
+from fastapi import HTTPException, Request
 
 @app.get("/api/v1/products")
 def list_products(request: Request):
-    user_email = request.headers.get("X-Webauth-Email")
-    username = request.headers.get("X-Webauth-User")
+    claims = verify_assertion(request)
+    if not claims:
+        raise HTTPException(status_code=401)
+    user_email = claims["email"]       # granting user; claims["n0_agent"] names the agent
     # Use the identity to filter/authorize...
 ```
 
 ```javascript
-// Express.js example
-app.get('/api/v1/products', (req, res) => {
-  const userEmail = req.headers['x-webauth-email'];
-  const username = req.headers['x-webauth-user'];
+// Express.js example (verifyAssertion from "Verifying identity: X-N0-Assertion")
+app.get('/api/v1/products', async (req, res) => {
+  const claims = await verifyAssertion(req);
+  if (!claims) return res.status(401).end();
+  const userEmail = claims.email;
   // Use the identity to filter/authorize...
 });
 ```
@@ -2578,7 +2758,7 @@ For connectors that need real logic (pagination, aggregation, multi-step operati
 ```
 
 - The platform calls `tools/list` on your MCP endpoint and exposes the returned tools to granted agents; tool calls are proxied via `tools/call`
-- Requests arrive through the identity proxy, so your MCP server receives `X-Webauth-*` headers identifying the acting user
+- Requests arrive through the identity proxy, so your MCP server receives a signed `X-N0-Assertion` (and plain `X-Webauth-*` headers, which you must not trust) identifying the acting user
 - Only MCP **tools** are supported (not resources/prompts)
 - Changing your tool list requires workspace-admin re-approval before agents see new/changed tools — keep tool definitions stable
 - Recommended scaffolding: FastMCP (Python) or the official TypeScript SDK, mounted at `/mcp` in the same service or as a sidecar service
@@ -2613,7 +2793,7 @@ Map route patterns to scopes:
 - [ ] `auth_type` is `platform_identity` (default) or `api_key`
 - [ ] `base_path` starts with `/` and has no path traversal (`..`)
 - [ ] `help_url_path` starts with `/` (if provided)
-- [ ] App reads `X-Webauth-*` headers for `platform_identity` connectors (same as SSO)
+- [ ] App verifies `X-N0-Assertion` (not the plain `X-Webauth-*` headers) for `platform_identity` connectors
 - [ ] Scopes are descriptive and follow `resource:action` pattern
 - [ ] For `api_key` connectors: `help_text` explains how to get a key
 - [ ] *(Once ADR-0033 ships)* If declaring named `tools`: each has a valid JSON Schema in `parameters`, an LLM-friendly `description`, `snake_case` names, and `{{param}}` placeholders matching schema properties
@@ -2839,6 +3019,9 @@ Before finalizing, verify:
 - [ ] Database services include `POSTGRES_INITDB_ARGS: --data-checksums` for PostgreSQL
 - [ ] `depends_on` ordering is correct (databases -> migration -> app)
 - [ ] Migration/init services are defined for apps that need DB setup before starting
+- [ ] Migration/init services are one-shot (named `migrate`/`migration` or `"one_shot": true`) and exit when done
+- [ ] A single-service app with its own timers, schedulers or long-lived outbound connections sets `"always_on": true` (idle sleep)
+- [ ] Credential files use `secret_files`, never `config_files` or a base64 env var
 - [ ] Environment variables use `{{APP_URL}}` / `{{APP_DOMAIN}}` where needed
 - [ ] **Env vars and paths were verified against the upstream self-host compose** or container inspection — NEVER guessed
 - [ ] **Generated code was actually executed before finalizing** — run scripts/servers with the same runtime version as the service image and hit them once (`curl`/CLI); catches ESM/CJS mismatches (`"type": "module"` makes `require()` throw — use `import` or a `.cjs` entry) and other never-run breakage
@@ -2854,7 +3037,7 @@ Before finalizing, verify:
 - [ ] `access_level` set in manifest if anyone besides the owner should open the app (`"workspace"` for the team, `"public"` for no sign-in) — the default is owner-only
 - [ ] If the app has API routes, `connectors` section is included in the manifest
 - [ ] Connector `base_path` starts with `/` and matches the app's actual API prefix
-- [ ] App reads `X-Webauth-*` headers for `platform_identity` connectors
+- [ ] App verifies `X-N0-Assertion` (not the plain `X-Webauth-*` headers) for `platform_identity` connectors
 
 ## Deploy Validation
 
@@ -2911,6 +3094,35 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 ```
 
 **Common pitfall:** `wget -qO- http://localhost:3000/health` fails on Alpine because musl libc resolves `localhost` to `::1` (IPv6) but most apps only listen on `0.0.0.0` (IPv4). Always use `http://0.0.0.0:<port>` instead.
+
+### Idle Sleep
+
+Where the server has idle sleep switched on, an app that got no signed-in
+request, deploy or start for a day (`HOSTED_APP_IDLE_SLEEP_HOURS`, default 24) is scaled to zero:
+status `sleeping`. Image, volumes, secrets and the route are kept. The first
+request that passes the n0 sign-in gate gets a "Starting…" page (browsers; it
+refreshes itself) or a `503` with `Retry-After: 3` (API clients), and wakes the
+app; once the entrypoint is ready, requests are proxied as usual. Expect a cold
+start of seconds to a minute on that first request. `sleeping` is not an error.
+Refused requests (anonymous visitors to a gated app) neither count as use nor
+wake it.
+
+Only single-service Kubernetes apps can sleep. These never do:
+- apps with more than one service (workers, cron, databases, one-shots);
+- apps with `public_paths` or a Git/API bypass (webhooks skip the gate, so they
+  would neither count nor wake it), a custom domain, published connectors, or
+  in-cluster callers (`{{APP:<it>:INTERNAL}}` from another app, or
+  `allow_internal_from`);
+- previews, candidates and production apps with a live candidate, core apps;
+- apps marked **Always on**: `"always_on": true` at the top level of
+  `n0-app.json`, the app's Always-on setting, or
+  `PATCH $N0_API_BASE/workspaces/$WS_ID/apps/$APP_ID/` with `{"always_on": true}`
+  (`apps:write`; it also wakes a sleeping app at once).
+
+A single-service app that does work on its own — a timer, a scheduler, a
+background loop, a long-lived outbound connection (bot, queue consumer) — stops
+doing it while asleep: declare `"always_on": true`. A redeploy or Start also
+wakes the app.
 
 ## Deploying to the Platform (API Flow)
 
